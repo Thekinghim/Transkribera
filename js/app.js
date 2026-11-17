@@ -1505,6 +1505,17 @@ function bind() {
 }
 
 // ---------------------------------------------------------------- start
+// Personlig länk: …/Transkribera/#nyckel=sk-ant-… sparar nyckeln i webbläsaren och tar bort den ur adressfältet.
+// Delen efter # skickas aldrig till någon server.
+(function importKeyFromLink() {
+  const m = location.hash.match(/(?:^#|&)(?:nyckel|key)=([^&]+)/);
+  if (!m) return;
+  const key = decodeURIComponent(m[1]).trim();
+  history.replaceState(null, '', location.pathname + location.search);
+  if (!/^sk-ant-[\w-]{20,}$/.test(key)) { setTimeout(() => toast('Länken innehöll ingen giltig API-nyckel.', 5000), 300); return; }
+  setKey(key);
+  setTimeout(() => toast('Claude är kopplat ✓ – nyckeln är sparad i den här webbläsaren.', 6000), 300);
+})();
 bind();
 showSysInfo();
 renderLibrary();
