@@ -32,6 +32,7 @@ const state = {
 
 // ---------------------------------------------------------------- worker
 let worker = null;
+let onChunk = null;  // anropas när modellen är klar med en 30-sekundersdel
 let workerReady = null;
 let workerModel = null;
 let workerDevice = null;
@@ -54,6 +55,8 @@ function getWorker() {
     } else if (m.type === 'ready') {
       workerDevice = m.device;
       const p = pending.get('load'); pending.delete('load'); p?.resolve();
+    } else if (m.type === 'chunk') {
+      onChunk?.(m.done, m.total);
     } else if (m.type === 'result') {
       const p = pending.get(m.id); pending.delete(m.id); p?.resolve(m.segments);
     } else if (m.type === 'error') {
@@ -339,9 +342,13 @@ async function startTranscription() {
 
     while (lec.cursor < lec.duration - 0.3 && !state.stopRequested) {
       const start = lec.cursor;
-      const end = Math.min(start + BLOCK_SECONDS, lec.duration);
+      // första blocket är kort så att text och hastighet syns snabbt
+      const end = Math.min(start + (processed === 0 ? 60 : BLOCK_SECONDS), lec.duration);
       const isLast = end >= lec.duration - 0.3;
+      const wh = lec.duration >= 3600;
+      setStatus(`Läser ljudet ${fmtTime(start, wh)}–${fmtTime(end, wh)}…`);
       const audio = await src.read(start, end);
+      setStatus(`Transkriberar ${fmtTime(start, wh)}–${fmtTime(end, wh)} (${workerDevice === 'webgpu' ? 'grafikkort' : 'processor'})…`);
       if (state.stopRequested) break;
       const blockT = performance.now();
       // jämn progress mellan blocken, baserat på hittills uppmätt hastighet
@@ -353,7 +360,25 @@ async function startTranscription() {
           updateProgress(est / lec.duration, speedSoFar, (lec.duration - est) / speedSoFar);
         }, 1000);
       }
-      const raw = await transcribeBlock(audio);
+      let lastChunkAt = performance.now();
+      onChunk = (done, total) => {
+        lastChunkAt = performance.now();
+        clearInterval(ticker);
+        const frac = Math.min(1, done / Math.max(1, total));
+        const est = start + (end - start) * frac;
+        const elapsed = (performance.now() - t0) / 1000;
+        const sp = (processed + (est - start)) / Math.max(0.001, elapsed);
+        updateProgress(est / lec.duration, sp, (lec.duration - est) / sp);
+        setStatus(`Transkriberar ${fmtTime(start, wh)}–${fmtTime(end, wh)}: del ${Math.min(done, total)} av ${total} klar.`);
+      };
+      // vakthund: säg till om inget händer på länge (i stället för att stå still utan förklaring)
+      const watchdog = setInterval(() => {
+        const idle = (performance.now() - lastChunkAt) / 1000;
+        if (idle > 90) setStatus(`Arbetar fortfarande med ${fmtTime(start, wh)}–${fmtTime(end, wh)} (${Math.round(idle / 60)} min sedan förra delen, ${workerDevice === 'webgpu' ? 'grafikkort' : 'processor'}). ` +
+          (workerDevice === 'webgpu' ? 'Om inget händer på 5 min: ladda om sidan – texten hittills är sparad.' : 'Utan grafikkort går det långsamt – välj Snabb om du valt Noggrann.'));
+      }, 15000);
+      let raw;
+      try { raw = await transcribeBlock(audio); } finally { clearInterval(watchdog); onChunk = null; }
       clearInterval(ticker);
       let seg = cleanSegments(raw, start, end);
       let next = end;

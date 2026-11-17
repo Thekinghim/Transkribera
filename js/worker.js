@@ -71,7 +71,27 @@ async function load(modelKey, forceWasm = false) {
   post('ready', { device });
 }
 
+// Räknar färdiga 30-sekundersdelar så att sidan kan visa förlopp inom ett block.
+function instrument(pipe) {
+  const model = pipe?.model;
+  if (!model || model.__counted) return;
+  const gen = model.generate.bind(model);
+  model.generate = async (...args) => {
+    const r = await gen(...args);
+    chunksDone++;
+    post('chunk', { done: chunksDone, total: chunksTotal });
+    return r;
+  };
+  model.__counted = true;
+}
+let chunksDone = 0, chunksTotal = 0;
+
 async function transcribe(audio) {
+  instrument(asr);
+  // samma uppdelning som pipelinen: fönster 30 s, överlapp 5 s på varje sida => steg 20 s
+  const sec = audio.length / 16000;
+  chunksDone = 0;
+  chunksTotal = sec <= 30 ? 1 : Math.ceil((sec - 10) / 20);
   const out = await asr(audio, {
     language: 'swedish',
     task: 'transcribe',

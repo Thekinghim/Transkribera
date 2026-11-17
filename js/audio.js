@@ -201,14 +201,19 @@ async function decodeRange(src, start, end, feed) {
 }
 
 function waitForDequeue(decoder, target) {
+  // Väntar på att avkodarens kö krymper. Om avkodaren stängs av ett fel kommer inga fler
+  // 'dequeue'-händelser – därför även en kontroll med jämna mellanrum, så att vi aldrig hänger.
   return new Promise(resolve => {
+    let timer = null;
     const check = () => {
       if (decoder.decodeQueueSize <= target || decoder.state !== 'configured') {
         decoder.removeEventListener('dequeue', check);
+        clearInterval(timer);
         resolve();
       }
     };
     decoder.addEventListener('dequeue', check);
+    timer = setInterval(check, 200);
     check();
   });
 }
