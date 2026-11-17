@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transkribera – föreläsningar till text</title>
+<meta name="description" content="Transkribera föreläsningar på svenska direkt i webbläsaren med KB-Whisper. Gratis, ingen tidsgräns, videon laddas aldrig upp.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b5bdb'/%3E%3Cpath d='M9 11h14M9 16h14M9 21h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#" id="homeLink">
+    <span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8"/><path d="M9 11h14M9 16h14M9 21h9"/></svg></span>
+    <span><b>Transkribera</b><small>Föreläsningar till text – privat i din webbläsare</small></span>
+  </a>
+  <nav>
+    <button class="btn ghost" id="navLibrary">Bibliotek</button>
+    <button class="btn primary" id="navNew">+ Ny transkribering</button>
+  </nav>
+</header>
+
+<!-- ============ STARTVY ============ -->
+<main id="startView" class="view">
+  <section class="hero">
+    <h1>Gör om föreläsningar till text att plugga från</h1>
+    <p>Svensk taligenkänning (KB-Whisper från Kungliga biblioteket) som körs helt i din dator. Videon laddas aldrig upp – gratis och utan tidsgräns, även för flera timmar långa föreläsningar.</p>
+  </section>
+
+  <section class="card upload">
+    <label class="drop" id="drop">
+      <input type="file" id="fileInput" accept="video/*,audio/*,.mp4,.m4a,.mov,.mkv,.webm,.mp3,.wav,.ogg">
+      <svg viewBox="0 0 24 24" class="drop-icon" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+      <strong>Släpp en föreläsning här</strong>
+      <span>eller klicka för att välja fil · MP4 rekommenderas (även flera GB)</span>
+    </label>
+
+    <div class="options">
+      <fieldset class="seg-choice">
+        <legend>Kvalitet</legend>
+        <label><input type="radio" name="model" value="base" checked><span><b>Snabb</b><small>KB-Whisper base · bra för de flesta föreläsningar</small></span></label>
+        <label><input type="radio" name="model" value="small"><span><b>Noggrann</b><small>KB-Whisper small · färre fel, ca 2–3 gånger långsammare</small></span></label>
+      </fieldset>
+      <div class="sysinfo" id="sysinfo">Kontrollerar din dator…</div>
+    </div>
+  </section>
+
+  <section class="features">
+    <div><b>🔒 Privat</b><span>Allt händer i webbläsaren. Inget skickas iväg.</span></div>
+    <div><b>⏯️ Klicka för att lyssna</b><span>Klicka på en mening så hoppar videon dit.</span></div>
+    <div><b>⭐ Plugga smart</b><span>Viktigt-markeringar, nyckelbegrepp, avsnitt och förhör.</span></div>
+    <div><b>💾 Sparas automatiskt</b><span>Stäng fliken och fortsätt senare där du var.</span></div>
+  </section>
+
+  <section id="librarySection">
+    <div class="section-head">
+      <h2>Dina föreläsningar</h2>
+      <span class="muted" id="storageInfo"></span>
+    </div>
+    <div id="library" class="library"></div>
+  </section>
+</main>
+
+<!-- ============ ARBETSVY ============ -->
+<main id="workView" class="view hidden">
+  <div class="work">
+    <aside class="side">
+      <div class="title-row">
+        <input id="lectureTitle" class="title-input" aria-label="Föreläsningens namn" spellcheck="false">
+      </div>
+
+      <div class="player card">
+        <div class="video-wrap" id="videoWrap">
+          <video id="video" playsinline preload="metadata"></video>
+          <div class="no-video" id="noVideo">
+            <p>Videon är inte kopplad.</p>
+            <label class="btn small">Välj videofilen<input type="file" id="attachInput" accept="video/*,audio/*" hidden></label>
+          </div>
+        </div>
+        <div class="controls">
+          <button class="icon-btn" id="back10" title="Bakåt 10 s (←)">↺10</button>
+          <button class="icon-btn play" id="playBtn" title="Spela/pausa (mellanslag)">▶</button>
+          <button class="icon-btn" id="fwd10" title="Framåt 10 s (→)">10↻</button>
+          <span class="time" id="timeLabel">0:00 / 0:00</span>
+          <select id="rate" title="Uppspelningshastighet">
+            <option value="0.75">0,75×</option><option value="1" selected>1×</option><option value="1.25">1,25×</option>
+            <option value="1.5">1,5×</option><option value="1.75">1,75×</option><option value="2">2×</option>
+          </select>
+        </div>
+        <input type="range" id="seek" min="0" max="1000" value="0" class="seekbar" aria-label="Position">
+      </div>
+
+      <div class="progress card hidden" id="progressCard">
+        <div class="progress-head">
+          <b id="progressTitle">Transkriberar…</b>
+          <span id="progressPct">0 %</span>
+        </div>
+        <div class="bar"><div id="progressBar"></div></div>
+        <div class="progress-stats">
+          <span id="progressSpeed">–</span>
+          <span id="progressEta">–</span>
+        </div>
+        <div class="progress-status muted" id="progressStatus"></div>
+        <div class="progress-actions">
+          <button class="btn small" id="pauseBtn">Pausa</button>
+          <span class="muted tiny" id="wakeInfo"></span>
+        </div>
+      </div>
+
+      <div class="resume card hidden" id="resumeCard">
+        <p id="resumeText"></p>
+        <label class="btn primary small">Välj filen och fortsätt<input type="file" id="resumeInput" accept="video/*,audio/*" hidden></label>
+      </div>
+
+      <div class="card panel">
+        <div class="panel-head"><h3>Innehåll</h3><span class="muted tiny">automatiska avsnitt</span></div>
+        <ol id="chapterList" class="chapters"><li class="muted">Visas när texten är klar.</li></ol>
+      </div>
+
+      <div class="card panel">
+        <div class="panel-head"><h3>Nyckelbegrepp</h3><span class="muted tiny">klicka för att söka</span></div>
+        <div id="keywordList" class="chips"><span class="muted">Visas när texten är klar.</span></div>
+      </div>
+    </aside>
+
+    <section class="main">
+      <div class="toolbar card">
+        <div class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input type="search" id="searchInput" placeholder="Sök i texten  ( / )" autocomplete="off">
+          <span class="search-count" id="searchCount"></span>
+          <button class="icon-btn small" id="searchPrev" title="Föregående träff">↑</button>
+          <button class="icon-btn small" id="searchNext" title="Nästa träff">↓</button>
+        </div>
+        <div class="tool-row">
+          <div class="toggle-group" role="group" aria-label="Filter">
+            <button class="tg active" data-filter="all">Allt</button>
+            <button class="tg" data-filter="star">⭐ Stjärnmärkt <span id="starCount"></span></button>
+            <button class="tg" data-filter="cue">❗ Viktigt <span id="cueCount"></span></button>
+          </div>
+          <div class="toggle-group" role="group" aria-label="Visning">
+            <button class="tg active" data-mode="segments" title="Som i Word: en rad per avsnitt med tidsstämpel">Avsnitt</button>
+            <button class="tg" data-mode="reading" title="Löpande text i stycken">Läsläge</button>
+          </div>
+          <label class="follow"><input type="checkbox" id="followToggle" checked> Följ uppspelningen</label>
+          <span class="spacer"></span>
+          <button class="btn small accent" id="quizBtn">🧠 Förhör mig</button>
+          <button class="btn small accent" id="aiBtn">✨ Plugga med AI</button>
+          <div class="menu">
+            <button class="btn small" id="exportBtn">Exportera ▾</button>
+            <div class="menu-list hidden" id="exportMenu">
+              <button data-export="doc">Word (.doc)</button>
+              <button data-export="txt">Text (.txt)</button>
+              <button data-export="md">Markdown (.md)</button>
+              <button data-export="srt">Undertexter (.srt)</button>
+              <hr>
+              <button data-export="copy">Kopiera all text</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="transcript" class="transcript card" tabindex="-1"></div>
+      <div class="transcript-foot muted tiny" id="transcriptFoot"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ============ AI-DIALOG ============ -->
+<dialog id="aiDialog" class="dialog">
+  <form method="dialog" class="dialog-inner">
+    <div class="dialog-head"><h2>✨ Plugga med AI</h2><button class="icon-btn" value="close" aria-label="Stäng">✕</button></div>
+    <p class="muted">Välj vad du vill ha hjälp med. Instruktionen och texten kopieras, och claude.ai öppnas i en ny flik – klistra in med <kbd>Ctrl</kbd>+<kbd>V</kbd> och tryck Enter.</p>
+    <fieldset class="scope">
+      <legend>Vilken text?</legend>
+      <label><input type="radio" name="scope" value="all" checked> Hela föreläsningen</label>
+      <label><input type="radio" name="scope" value="chapter"> Avsnittet som spelas nu <span class="muted" id="scopeChapterName"></span></label>
+      <label><input type="radio" name="scope" value="star"> Bara stjärnmärkt</label>
+    </fieldset>
+    <div class="ai-grid" id="aiGrid"></div>
+    <p class="muted tiny" id="aiInfo"></p>
+  </form>
+</dialog>
+
+<!-- ============ FÖRHÖR ============ -->
+<dialog id="quizDialog" class="dialog">
+  <div class="dialog-inner">
+    <div class="dialog-head"><h2>🧠 Förhör</h2><button class="icon-btn" id="quizClose" aria-label="Stäng">✕</button></div>
+    <div id="quizBody"></div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
