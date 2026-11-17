@@ -385,3 +385,4 @@ textarea.quiz-input { resize: vertical; font: inherit; }
 .grade { border-radius: 10px; padding: 8px 10px; background: var(--surface); font-weight: 400; }
 .grade b { font-weight: 700; }
 .btn.suggested { outline: 3px solid var(--accent); outline-offset: 1px; }
+.cpu-toggle { display: inline-flex; gap: 6px; align-items: center; margin-top: 6px; cursor: pointer; }

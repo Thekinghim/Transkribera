@@ -72,17 +72,33 @@ function getWorker() {
   return worker;
 }
 
-function loadModel(model) {
-  if (workerReady && workerModel === model) return workerReady;
+// Grafikkortet (WebGPU) fungerar inte på alla datorer. Har det hängt sig en gång minns vi det.
+const CPU_KEY = 'transkribera.useCpu';
+function preferCpu() { try { return localStorage.getItem(CPU_KEY) === '1'; } catch { return false; } }
+function setPreferCpu(on) { try { on ? localStorage.setItem(CPU_KEY, '1') : localStorage.removeItem(CPU_KEY); } catch {} }
+
+function loadModel(model, forceWasm = preferCpu()) {
+  const key = model + (forceWasm ? ':cpu' : '');
+  if (workerReady && workerModel === key) return workerReady;
+  if (worker && workerModel && workerModel !== key) killWorker('byter modell');
   const w = getWorker();
-  workerModel = model;
+  workerModel = key;
   downloads.clear();
   workerReady = new Promise((resolve, reject) => {
     pending.set('load', { resolve, reject });
-    w.postMessage({ type: 'load', model });
+    w.postMessage({ type: 'load', model, forceWasm });
   }).catch(e => { workerReady = null; workerModel = null; throw e; });
   return workerReady;
 }
+
+// Stänger workern helt (t.ex. när grafikkortet hängt sig) och avbryter väntande anrop.
+function killWorker(reason) {
+  try { worker?.terminate(); } catch {}
+  for (const p of pending.values()) p.reject(new Error(reason));
+  pending.clear();
+  worker = null; workerReady = null; workerModel = null; workerDevice = null;
+}
+const GPU_STALL_SECONDS = 100;
 
 function transcribeBlock(audio) {
   const id = ++reqId;
@@ -143,7 +159,9 @@ async function showSysInfo() {
     const est = await navigator.storage?.estimate?.();
     if (est?.quota) $('storageInfo').textContent = `Sparat lokalt: ${formatBytes(est.usage || 0)}`;
   } catch {}
+  parts.push(`<label class="cpu-toggle"><input type="checkbox" id="cpuToggle"${preferCpu() ? ' checked' : ''}> Använd processorn i stället för grafikkortet <span class="muted">(om transkriberingen står still)</span></label>`);
   el.innerHTML = parts.join('<br>');
+  $('cpuToggle').onchange = (e) => { setPreferCpu(e.target.checked); if (!state.running) killWorker('inställning ändrad'); };
 }
 
 // ---------------------------------------------------------------- vyer
@@ -371,14 +389,37 @@ async function startTranscription() {
         updateProgress(est / lec.duration, sp, (lec.duration - est) / sp);
         setStatus(`Transkriberar ${fmtTime(start, wh)}–${fmtTime(end, wh)}: del ${Math.min(done, total)} av ${total} klar.`);
       };
-      // vakthund: säg till om inget händer på länge (i stället för att stå still utan förklaring)
-      const watchdog = setInterval(() => {
-        const idle = (performance.now() - lastChunkAt) / 1000;
-        if (idle > 90) setStatus(`Arbetar fortfarande med ${fmtTime(start, wh)}–${fmtTime(end, wh)} (${Math.round(idle / 60)} min sedan förra delen, ${workerDevice === 'webgpu' ? 'grafikkort' : 'processor'}). ` +
-          (workerDevice === 'webgpu' ? 'Om inget händer på 5 min: ladda om sidan – texten hittills är sparad.' : 'Utan grafikkort går det långsamt – välj Snabb om du valt Noggrann.'));
-      }, 15000);
+      // Vakthund: om grafikkortet inte blir klart med en 30-sekundersdel inom rimlig tid har det
+      // hängt sig (händer på vissa datorer). Då stängs det av och processorn tar över automatiskt.
       let raw;
-      try { raw = await transcribeBlock(audio); } finally { clearInterval(watchdog); onChunk = null; }
+      for (;;) {
+        let stalled = false;
+        const watchdog = setInterval(() => {
+          const idle = (performance.now() - lastChunkAt) / 1000;
+          if (workerDevice === 'webgpu' && idle > GPU_STALL_SECONDS) {
+            stalled = true;
+            killWorker('GPU_STALL');
+          } else if (idle > 90) {
+            setStatus(`Arbetar fortfarande med ${fmtTime(start, wh)}–${fmtTime(end, wh)} (${Math.round(idle / 60)} min sedan förra delen). ` +
+              (lec.model === 'small' ? 'Utan grafikkort är Noggrann mycket långsam – pausa och välj Snabb för snabbare resultat.' : 'Processorn arbetar – det går långsammare än med grafikkort men blir klart.'));
+          }
+        }, 5000);
+        try {
+          raw = await transcribeBlock(audio.slice()); // kopia – originalet behövs om vi måste göra om
+          break;
+        } catch (e) {
+          if (!stalled) throw e;
+          setPreferCpu(true);
+          toast('Grafikkortet svarade inte – byter till processorn och fortsätter.', 6000);
+          setStatus('Grafikkortet svarade inte. Laddar modellen för processorn…');
+          await loadModel(lec.model || 'base', true);
+          setStatus(`Transkriberar ${fmtTime(start, wh)}–${fmtTime(end, wh)} (processor)…`);
+          lastChunkAt = performance.now();
+        } finally {
+          clearInterval(watchdog);
+        }
+      }
+      onChunk = null;
       clearInterval(ticker);
       let seg = cleanSegments(raw, start, end);
       let next = end;
