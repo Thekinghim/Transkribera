@@ -3,6 +3,11 @@ import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transfo
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
+// Flera trådar när sidan är cross-origin isolated (se coi-serviceworker.js) – flera gånger snabbare på processorn
+if (self.crossOriginIsolated && env.backends?.onnx?.wasm) {
+  const cores = self.navigator?.hardwareConcurrency || 4;
+  env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(8, cores - 1));
+}
 
 let asr = null;
 let loadedKey = null;

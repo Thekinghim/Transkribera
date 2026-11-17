@@ -7,6 +7,21 @@
 <meta name="description" content="Transkribera föreläsningar på svenska direkt i webbläsaren med KB-Whisper. Gratis, ingen tidsgräns, videon laddas aldrig upp.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b5bdb'/%3E%3Cpath d='M9 11h14M9 16h14M9 21h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="css/style.css">
+<script>
+// Aktivera flera processorkärnor (se coi-serviceworker.js). Laddar om sidan en gång första gången.
+(function () {
+  if (window.crossOriginIsolated || !('serviceWorker' in navigator) || !window.isSecureContext) return;
+  navigator.serviceWorker.register('coi-serviceworker.js').then(function (reg) {
+    var reloaded = false;
+    try { reloaded = sessionStorage.getItem('coiReloaded') === '1'; } catch (e) {}
+    if (reloaded) return; // undvik omladdningsloop om det ändå inte går
+    var go = function () { try { sessionStorage.setItem('coiReloaded', '1'); } catch (e) {} location.reload(); };
+    if (navigator.serviceWorker.controller) { go(); return; }
+    navigator.serviceWorker.addEventListener('controllerchange', go);
+    if (reg.active && !navigator.serviceWorker.controller) setTimeout(go, 300);
+  }).catch(function () {});
+})();
+</script>
 </head>
 <body>
 <header class="topbar">

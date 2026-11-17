@@ -364,7 +364,7 @@ async function startTranscription() {
     $('progressTitle').textContent = 'Laddar modellen…';
     await loadModel(lec.model || 'base');
     $('progressTitle').textContent = 'Transkriberar…';
-    setStatus(workerDevice === 'webgpu' ? 'Använder grafikkortet (WebGPU).' : (lec.model === 'small' ? 'Använder processorn (WASM) – Noggrann blir mycket långsam utan grafikkort. Välj hellre Snabb för nästa föreläsning.' : 'Använder processorn (WASM) – det tar längre tid än med grafikkort.'));
+    setStatus(workerDevice === 'webgpu' ? 'Använder grafikkortet (WebGPU).' : !self.crossOriginIsolated ? 'Använder processorn med en kärna – ladda om sidan (Ctrl+Shift+R) för att använda alla kärnor.' : (lec.model === 'small' ? 'Använder processorn (WASM) – Noggrann blir mycket långsam utan grafikkort. Välj hellre Snabb för nästa föreläsning.' : 'Använder processorn (WASM) – det tar längre tid än med grafikkort.'));
 
     // Rensa skräptext som sparats från en tidigare körning och fortsätt därifrån
     const firstBad = lec.segments.findIndex(x => isGarbage(x.t));
@@ -485,6 +485,11 @@ async function startTranscription() {
       setStatus('Allt hittills är sparat. Du kan fortsätta när du vill – även efter att ha stängt fliken.');
     }
   } catch (e) {
+    if (state.stopRequested) {
+      $('progressTitle').textContent = 'Pausad';
+      setStatus('Allt hittills är sparat. Du kan fortsätta när du vill – även efter att ha stängt fliken.');
+      return;
+    }
     console.error(e);
     $('progressTitle').textContent = 'Något gick fel';
     const msg = e instanceof UserFacingError ? e.message : `Fel: ${e.message || e}`;
@@ -1462,9 +1467,11 @@ function bind() {
     if (state.file && state.lecture && fileKey(state.file) === state.lecture.id) { e.preventDefault(); startTranscription(); }
   });
   $('pauseBtn').onclick = () => {
+    // Pausa direkt: avbryt pågående arbete. Allt som redan är klart är sparat; den påbörjade delen görs om vid fortsättning.
     state.stopRequested = true;
     $('pauseBtn').disabled = true;
-    $('progressTitle').textContent = 'Pausar efter nuvarande del…';
+    $('progressTitle').textContent = 'Pausar…';
+    if (state.running) killWorker('PAUSED');
   };
 
   $('lectureTitle').addEventListener('change', (e) => {
