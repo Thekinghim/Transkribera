@@ -39,7 +39,15 @@ export async function openAudioSource(file, options = {}) {
     await src.open();
     return src;
   }
-  if (file.size > SMALL_FILE_LIMIT) {
+  const raw = await detectRawAudio(file);
+  if (raw) {
+    const src = new RawAudioSource(file, raw, options);
+    await src.open();
+    return src;
+  }
+  // decodeAudioData avkodar allt på en gång: begränsa så att fliken inte får slut på minne
+  const limit = /\.(wav|wave|aif|aiff)$/i.test(file.name) ? SMALL_FILE_LIMIT : 60 * 1024 * 1024;
+  if (file.size > limit) {
     throw new UserFacingError(
       `Filen är ${formatBytes(file.size)} och i ett format som inte kan läsas i bitar. ` +
       'Konvertera den till MP4 (t.ex. med HandBrake eller VLC → "Konvertera/Spara") eller ' +
@@ -392,7 +400,9 @@ class Mp4AudioSource {
 
     let codec = track.codec || '';
     let description;
-    const dsi = entry?.esds?.esd?.descs?.[0]?.descs?.[0]?.data;
+    // QuickTime-MOV har ofta esds inuti mp4a > wave
+    const esds = entry?.esds ?? entry?.wave?.esds;
+    const dsi = esds?.esd?.findDescriptor?.(4)?.findDescriptor?.(5)?.data ?? esds?.esd?.descs?.[0]?.descs?.[0]?.data;
     if (dsi) description = new Uint8Array(dsi);
     if (/^mp4a\.40$/.test(codec)) codec = 'mp4a.40.2';
     if (codec === 'mp4a') codec = 'mp4a.40.2';
@@ -867,7 +877,113 @@ class TsAudioSource {
 }
 
 // ---------------------------------------------------------------------------
-// Små filer i andra format (mp3, wav, webm, ogg ...): decodeAudioData.
+// Rena ljudströmmar: AAC i ADTS (.aac – t.ex. "Bara ljud" från tillägget) och MP3.
+// Ramarna är självständiga, så filen indexeras en gång och läses sedan bit för bit.
+
+async function detectRawAudio(file) {
+  if (file.size < 16) return null;
+  let skip = 0;
+  const head = new Uint8Array(await file.slice(0, 10).arrayBuffer());
+  if (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) { // ID3v2-tagg
+    skip = 10 + ((head[6] & 0x7f) << 21 | (head[7] & 0x7f) << 14 | (head[8] & 0x7f) << 7 | (head[9] & 0x7f));
+    if (head[5] & 0x10) skip += 10;
+  }
+  const d = new Uint8Array(await file.slice(skip, skip + 65536).arrayBuffer());
+  for (const [kind, parse] of [['aac', parseAdts], ['mp3', parseMpegAudio]]) {
+    // kräv tre giltiga ramar i följd inom de första kilobyten
+    for (let pos = 0; pos < Math.min(d.length, 8192); pos++) {
+      const f1 = parse(d, pos);
+      if (!f1) continue;
+      const f2 = parse(d, pos + f1.len);
+      if (!f2) continue;
+      const f3 = parse(d, pos + f1.len + f2.len);
+      if (f3 === false) continue;
+      return { kind, parse, start: skip + pos };
+    }
+  }
+  return null;
+}
+
+const RAW_CHUNK = 8 * 1024 * 1024;
+const RAW_STEP = 64; // en indexpunkt per 64 ramar
+
+class RawAudioSource {
+  constructor(file, layout, options = {}) {
+    this.file = file; this.layout = layout; this.kind = layout.kind; this.onProgress = options.onProgress;
+  }
+
+  // Går igenom ramarna från byte `from` till `to` och anropar cb(data, offset, f) för varje.
+  async walk(from, to, cb) {
+    const parse = this.layout.parse;
+    let pos = from;
+    while (pos < to) {
+      const end = Math.min(this.file.size, pos + RAW_CHUNK);
+      const d = new Uint8Array(await this.file.slice(pos, end).arrayBuffer());
+      let i = 0;
+      while (i < d.length) {
+        const f = parse(d, i);
+        if (f === null) break;                 // ramen fortsätter i nästa bit
+        if (f === false) { i++; continue; }    // skräp/tagg – leta nästa synkord
+        if (cb(d, pos + i, i, f) === false) return;
+        i += f.len;
+        if (pos + i >= to) return;
+      }
+      if (end >= this.file.size) return;
+      if (i === 0) { pos = end; continue; }
+      pos += i;
+      this.onProgress?.(Math.min(1, pos / this.file.size));
+    }
+  }
+
+  async open() {
+    const offs = new Grow(Float64Array), times = new Grow(Float64Array);
+    let t = 0, k = 0, first = null;
+    await this.walk(this.layout.start, this.file.size, (d, off, i, f) => {
+      if (!first) first = f;
+      if (k % RAW_STEP === 0) { offs.push(off); times.push(t); }
+      t += f.dur; k++;
+    });
+    if (!first) throw new UserFacingError('Hittade inga ljudramar i filen. Den kan vara trasig.');
+    this.offsets = offs.done(); this.times = times.done(); this.n = this.offsets.length;
+    this.duration = t; this.frameDur = first.dur; this.sampleRate = first.rate;
+    let config;
+    if (this.kind === 'aac') {
+      const ot = first.profile + 1, chan = first.chan || 2;
+      const asc = new Uint8Array([(ot << 3) | (first.sfi >> 1), ((first.sfi & 1) << 7) | (chan << 3)]);
+      config = { codec: 'mp4a.40.' + ot, sampleRate: first.rate, numberOfChannels: chan === 7 ? 8 : chan, description: asc };
+    } else {
+      config = { codec: 'mp3', sampleRate: first.rate, numberOfChannels: first.chan };
+    }
+    await checkDecoderConfig(config);
+    this.config = config; this.codec = config.codec;
+    this.onProgress?.(1);
+  }
+
+  async read(start, end) {
+    end = Math.min(end, this.duration);
+    if (end <= start) return new Float32Array(0);
+    const fd = this.frameDur;
+    const from = start - 2.5 * fd, to = end + fd;
+    const p0 = Math.max(0, lowerBound(this.times, this.n, from) - 1);
+    const p1 = lowerBound(this.times, this.n, to + fd);
+    const byteEnd = p1 < this.n ? this.offsets[p1] : this.file.size;
+    return decodeRange(this, start, end, async (push) => {
+      let t = this.times[p0];
+      const frames = [];
+      await this.walk(this.offsets[p0], byteEnd, (d, off, i, f) => {
+        if (t >= from && t < to) frames.push([d.slice(i + f.hdr, i + f.len), t, f.dur]);
+        t += f.dur;
+        if (t >= to) return false;
+      });
+      for (const [data, ft, dur] of frames) await push(data, ft, dur);
+    });
+  }
+
+  close() { this.offsets = this.times = null; }
+}
+
+// ---------------------------------------------------------------------------
+// Små filer i andra format (wav, webm, ogg ...): decodeAudioData.
 class DecodedAudioSource {
   constructor(file) { this.file = file; this.kind = 'decoded'; this.codec = 'decodeAudioData'; }
   async open() {
