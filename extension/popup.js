@@ -169,6 +169,10 @@ function hlsCard(item) {
     btn.disabled = true;
     const id = Math.random().toString(36).slice(2);
     const job = { url: item.url, choice: select.value, name: currentName(), created: Date.now() };
+    // Adresser till delspellistor kan innehålla engångsnycklar som byts vid nästa hämtning,
+    // så skicka även bithastighet/upplösning så att rätt kvalitet kan hittas igen.
+    const v = (h.variants || []).find(x => x.uri === select.value);
+    if (v) job.variant = { bandwidth: v.bandwidth, width: v.width, height: v.height };
     await chrome.storage.session.set({ ['job:' + id]: job });
     await chrome.tabs.create({ url: chrome.runtime.getURL(`download.html?job=${id}`) });
     status.textContent = 'Öppnade nedladdningssidan.';

@@ -239,8 +239,11 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
-  if (info.title && state[tabId]) { state[tabId].title = info.title; save(tabId); }
-  if (info.status === 'complete') updateBadge(tabId);
+  // Vänta på sparat tillstånd: annars kan en nyss väckt service worker nollställa märket.
+  ready.then(() => {
+    if (info.title && state[tabId]) { state[tabId].title = info.title; save(tabId); }
+    if (info.status === 'complete') updateBadge(tabId);
+  });
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

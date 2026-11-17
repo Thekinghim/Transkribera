@@ -8,6 +8,7 @@ import { TsAudioExtractor, probeTsAudio } from './tsaudio.js';
 
 const PARALLEL = 4;
 const RETRIES = 3;
+const FETCH_TIMEOUT = 120000; // ms per segment och försök
 const params = new URLSearchParams(location.search);
 const TEST = params.get('test') === '1';
 const $ = id => document.getElementById(id);
@@ -61,7 +62,9 @@ async function fetchBytes(uri, byterange, signal) {
     try {
       const headers = {};
       if (byterange) headers.Range = `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`;
-      const r = await fetch(uri, { credentials: 'include', headers, signal });
+      // Tidsgräns per försök: en anslutning som hänger sig ska ge ett nytt försök, inte stå still för evigt.
+      const attemptSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(FETCH_TIMEOUT)]) : AbortSignal.timeout(FETCH_TIMEOUT);
+      const r = await fetch(uri, { credentials: 'include', headers, signal: attemptSignal });
       if (r.status === 401 || r.status === 403) {
         const e = new Error(`Servern nekade åtkomst (HTTP ${r.status}). Inloggningen kan ha gått ut – ladda om föreläsningssidan och försök igen.`);
         e.fatal = attempt >= 1; // ett nytt försök, sedan ge upp
@@ -74,9 +77,9 @@ async function fetchBytes(uri, byterange, signal) {
       }
       return buf;
     } catch (e) {
-      if (e.name === 'AbortError') throw e;
+      if (e.name === 'AbortError' || signal?.aborted) throw signal?.aborted ? new DOMException('Avbrutet', 'AbortError') : e;
       if (e.fatal) throw e;
-      lastErr = e;
+      lastErr = e.name === 'TimeoutError' ? new Error('servern svarade inte i tid') : e;
     }
   }
   throw new Error(`Ett segment gick inte att hämta efter ${RETRIES + 1} försök (${lastErr?.message || lastErr}).`);
@@ -98,7 +101,7 @@ async function resolveJob(job) {
       label = a.kind === 'lowest-variant' ? `Bara ljud (från lägsta kvaliteten, ${a.label})` : 'Bara ljud';
     } else {
       const sorted = [...pl.variants].sort((a, b) => b.bandwidth - a.bandwidth);
-      const v = (job.choice && job.choice !== 'best' && sorted.find(x => x.uri === job.choice)) || sorted[0];
+      const v = findVariant(sorted, job) || sorted[0];
       uri = v.uri; label = variantLabel(v);
       if (isAudioOnlyCodecs(v.codecs)) audioOnly = true;
       if (v.audio && pl.media.some(m => m.type === 'AUDIO' && m.groupId === v.audio && m.uri)) {
@@ -116,6 +119,20 @@ async function resolveJob(job) {
   if (pl.encrypted) return { encrypted: pl.encrypted };
   if (!pl.segments.length) throw new Error('Spellistan innehåller inga segment.');
   return { playlist: pl, label, audioOnly, audioKind };
+}
+
+// Hitta den valda kvaliteten igen. Adressen räcker inte alltid: delspellistornas adresser kan
+// innehålla engångsnycklar (t.ex. hos Kaltura/CDN) som är nya när spellistan hämtas på nytt.
+export function findVariant(sorted, job) {
+  if (!job.choice || job.choice === 'best' || job.choice === 'audio') return null;
+  const byUri = sorted.find(x => x.uri === job.choice);
+  if (byUri) return byUri;
+  const w = job.variant;
+  if (!w) return null;
+  return sorted.find(x => x.bandwidth === w.bandwidth && x.height === w.height && x.width === w.width)
+    || sorted.find(x => x.bandwidth === w.bandwidth)
+    || (w.height ? sorted.find(x => x.height === w.height) : null)
+    || null;
 }
 
 function sniff(bytes) {
@@ -317,6 +334,7 @@ async function run({ pl, firstBytes, mode, ext, fileName }, writer) {
     window.__result = { status: 'done', file: writer.name, written, downloaded, segments: N, ext, mode };
   } catch (e) {
     running = false;
+    controller.abort(); // stoppa segment som fortfarande hämtas i förväg
     try { await writer.abort(); } catch {}
     $('cancel').hidden = true;
     if (e.name === 'AbortError') {
