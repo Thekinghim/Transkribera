@@ -72,70 +72,123 @@ async function looksLikeMp4(file) {
 // Anroparen ska börja ett par ramar före `start` så att AAC-avkodarens överlapp blir
 // rätt – överskottet kastas här.
 
+const MAX_RECOVERIES = 50; // trasiga ramar per read() innan vi ger upp
+
 async function decodeRange(src, start, end, feed) {
   const rate = src.sampleRate;
   let mono = new Float32Array(Math.ceil((end - start + 1) * rate) + 8192);
   let written = 0;
-  let decodeError = null;
+  let decodeError = null; // avkodningsfel (trasig ram) – går att återhämta
+  let fatal = null;       // övriga fel
+  let recoveries = 0;
   let monoStart = null; // tid (s) för första avkodade frame
   let outRate = rate;
+  // Ramar som skickats till avkodaren men inte kommit ut än: [data, tid µs, längd µs]
+  let inflight = [], head = 0;
 
-  const decoder = new AudioDecoder({
-    output: (data) => {
-      try {
-        const n = data.numberOfFrames;
-        const ch = data.numberOfChannels;
-        if (data.sampleRate && data.sampleRate !== outRate && written === 0) outRate = data.sampleRate;
-        if (monoStart === null) monoStart = data.timestamp / 1e6;
-        // Placera enligt tidsstämpel så att eventuella luckor blir tystnad
-        const pos = Math.max(written, Math.round((data.timestamp / 1e6 - monoStart) * outRate));
-        if (pos + n > mono.length) {
-          const bigger = new Float32Array(Math.max(mono.length * 1.5, pos + n + outRate) | 0);
-          bigger.set(mono.subarray(0, written));
-          mono = bigger;
-        }
-        const tmp = new Float32Array(n);
-        // copyTo med format 'f32-planar' konverterar även interfolierade format
-        for (let c = 0; c < ch; c++) {
-          data.copyTo(tmp, { planeIndex: c, format: 'f32-planar' });
-          for (let k = 0; k < n; k++) mono[pos + k] += tmp[k] / ch;
-        }
-        written = pos + n;
-      } catch (e) {
-        decodeError = e;
-      } finally {
-        data.close();
+  const output = (data) => {
+    try {
+      const n = data.numberOfFrames;
+      const ch = data.numberOfChannels;
+      while (head < inflight.length && inflight[head][1] <= data.timestamp) head++;
+      if (head > 4096) { inflight = inflight.slice(head); head = 0; }
+      if (data.sampleRate && data.sampleRate !== outRate && written === 0) outRate = data.sampleRate;
+      if (monoStart === null) monoStart = data.timestamp / 1e6;
+      // Placera enligt tidsstämpel (luckor mellan avkodarföljder blir tystnad, se feedChunk)
+      const pos = Math.max(written, Math.round((data.timestamp / 1e6 - monoStart) * outRate));
+      if (pos + n > mono.length) {
+        const bigger = new Float32Array(Math.max(mono.length * 1.5, pos + n + outRate) | 0);
+        bigger.set(mono.subarray(0, written));
+        mono = bigger;
       }
-    },
-    error: (e) => { decodeError = e; },
-  });
-  decoder.configure(src.config);
+      const tmp = new Float32Array(n);
+      // copyTo med format 'f32-planar' konverterar även interfolierade format
+      for (let c = 0; c < ch; c++) {
+        data.copyTo(tmp, { planeIndex: c, format: 'f32-planar' });
+        for (let k = 0; k < n; k++) mono[pos + k] += tmp[k] / ch;
+      }
+      written = pos + n;
+    } catch (e) {
+      fatal = e;
+    } finally {
+      data.close();
+    }
+  };
+
+  let decoder;
+  let nextT = null; // väntad tidsstämpel (µs) för nästa ram i samma följd
+  const makeDecoder = () => {
+    decoder = new AudioDecoder({ output, error: (e) => { if (!decodeError) decodeError = e; } });
+    decoder.configure(src.config);
+    nextT = null;
+  };
+  const send = (c) => {
+    inflight.push(c);
+    decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: c[1], duration: c[2], data: c[0] }));
+  };
+  // Chromes avkodare räknar ut tidsstämplarna på utdata från första ramens tid plus antal
+  // avkodade sampel – luckor i indata syns alltså inte. Vid en lucka (t.ex. ett segment som
+  // saknas) avslutas därför avkodaren och en ny startas, så att luckan blir tystnad.
+  const feedChunk = async (c) => {
+    if (nextT !== null && c[1] - nextT > 1.5 * c[2]) {
+      await finishDecoder();
+      decoder.close();
+      inflight = []; head = 0;
+      makeDecoder();
+    }
+    nextT = c[1] + c[2];
+    send(c);
+  };
+  // En trasig ram (t.ex. ett avbrutet HLS-segment) stänger avkodaren. Starta en ny, hoppa över
+  // ramen som felade och skicka om de ramar som redan låg i kön. Bortfallna ramar blir tystnad.
+  const recover = async () => {
+    if (fatal) throw fatal;
+    const e = decodeError;
+    if (!e || !/^(EncodingError|OperationError)$/.test(e.name) || ++recoveries > MAX_RECOVERIES) throw e;
+    decodeError = null;
+    if (decoder.state !== 'closed') decoder.close();
+    const redo = inflight.slice(head + 1);
+    inflight = []; head = 0;
+    makeDecoder();
+    for (const c of redo) await feedChunk(c);
+  };
+  // Väntar tills alla skickade ramar är avkodade (och återhämtar trasiga ramar på vägen)
+  const finishDecoder = async () => {
+    for (;;) {
+      if (fatal) throw fatal;
+      if (decodeError) await recover();
+      try { await decoder.flush(); } catch (e) { if (!decodeError) decodeError = e; }
+      if (!decodeError && !fatal) return;
+    }
+  };
+  makeDecoder();
 
   const push = async (data, t, dur) => {
-    if (decodeError) throw decodeError;
-    decoder.decode(new EncodedAudioChunk({
-      type: 'key',
-      timestamp: Math.round(t * 1e6),
-      duration: Math.round(dur * 1e6),
-      data,
-    }));
+    if (fatal) throw fatal;
+    if (decodeError) await recover();
+    await feedChunk([data, Math.round(t * 1e6), Math.round(dur * 1e6)]);
     if (decoder.decodeQueueSize > 256) await waitForDequeue(decoder, 64);
   };
 
   try {
     await feed(push);
-    if (decodeError) throw decodeError;
-    await decoder.flush();
+    await finishDecoder();
   } finally {
     if (decoder.state !== 'closed') decoder.close();
   }
-  if (decodeError) throw decodeError;
+  if (fatal) throw fatal;
+  if (recoveries) src.recoveries = (src.recoveries || 0) + recoveries; // diagnostik
   if (monoStart === null) return new Float32Array(Math.round((end - start) * TARGET_RATE));
 
-  // Klipp ut exakt [start, end)
+  // Klipp ut exakt [start, end); saknade ramar i slutet blir tystnad så att längden stämmer
   const from = Math.max(0, Math.round((start - monoStart) * outRate));
-  const to = Math.min(written, Math.round((end - monoStart) * outRate));
-  const cut = mono.subarray(from, Math.max(from, to));
+  const to = Math.max(from, Math.round((end - monoStart) * outRate));
+  let cut = mono.subarray(from, Math.min(written, to));
+  if (cut.length < to - from) {
+    const padded = new Float32Array(to - from);
+    padded.set(cut);
+    cut = padded;
+  }
   return resampleTo16k(cut, outRate);
 }
 
@@ -327,6 +380,14 @@ class Mp4AudioSource {
         if (this.onProgress && (i & 255) === 0) this.onProgress(0.5 + 0.5 * i / mo.length);
       }
     }
+    // Ofullständigt nedladdad fil: använd bara sampel som faktiskt finns i filen
+    for (let i = 0; i < offsets.n; i++) {
+      if (offsets.a[i] + sizes.a[i] > file.size) {
+        this.truncated = true;
+        offsets.n = sizes.n = ticks.n = durs.n = i;
+        break;
+      }
+    }
     if (!offsets.n) throw new UserFacingError('Ljudspåret innehåller inga ljuddata.');
 
     let codec = track.codec || '';
@@ -414,7 +475,7 @@ function parseMoof(buf, moofOffset, trackId, trex, state, out) {
     let tid = -1, flags = 0, base = 0, defDur = trex.default_sample_duration || 0, defSize = trex.default_sample_size || 0;
     let tfdt = null;
     let dataPtr = null, dataEnd = null;
-    forEachChild(dv, s, e, (t, bs) => {
+    forEachChild(dv, s, e, (t, bs, be) => {
       if (t === 'tfhd') {
         flags = dv.getUint32(bs) & 0xffffff;
         tid = dv.getUint32(bs + 4);
@@ -429,10 +490,13 @@ function parseMoof(buf, moofOffset, trackId, trex, state, out) {
       } else if (t === 'trun') {
         const vf = dv.getUint32(bs);
         const version = vf >>> 24, tf = vf & 0xffffff;
-        const count = dv.getUint32(bs + 4);
+        let count = dv.getUint32(bs + 4);
         let p = bs + 8;
         if (tf & 0x1) { dataPtr = base + dv.getInt32(p); p += 4; } else if (dataPtr === null) dataPtr = base;
         if (tf & 0x4) p += 4;
+        // trasig/avklippt box: läs inte förbi boxens slut
+        const per = 4 * ((tf >> 8 & 1) + (tf >> 9 & 1) + (tf >> 10 & 1) + (tf >> 11 & 1));
+        if (per) count = Math.min(count, Math.max(0, Math.floor((be - p) / per)));
         const mine = tid === trackId;
         if (mine && tfdt !== null) { state.nextDts = tfdt; tfdt = null; }
         for (let k = 0; k < count; k++) {
@@ -586,7 +650,13 @@ class FrameSplitter {
     while (pos < data.length) {
       const f = this.parse(data, pos);
       if (f === null) { this.carry = data.slice(pos); break; }
-      if (f === false) { pos++; continue; } // tappad synk – leta vidare
+      // En ram godtas bara om nästa ramhuvud (när det redan finns i bufferten) också är giltigt.
+      // Det sållar bort falska synkord mitt i ljuddata och ramar som klippts av, t.ex. när ett
+      // HLS-segment laddats ned ofullständigt och nästa segment tar vid mitt i en ram.
+      if (f === false || this.parse(data, pos + f.len) === false) {
+        pos = pos < at ? at : pos + 1; // en avklippt ram från förra PES-paketet kastas helt
+        continue;
+      }
       if (pending >= 0 && pos >= pending) { this.nextTime = time; pending = -1; }
       if (this.nextTime !== null) {
         emit(data.subarray(pos + f.hdr, pos + f.len), this.nextTime, f);

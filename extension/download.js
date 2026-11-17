@@ -77,9 +77,10 @@ async function fetchBytes(uri, byterange, signal) {
       }
       return buf;
     } catch (e) {
-      if (e.name === 'AbortError' || signal?.aborted) throw signal?.aborted ? new DOMException('Avbrutet', 'AbortError') : e;
+      // Bara användarens Avbryt stoppar; tidsgränsen kan ge AbortError eller TimeoutError och ska ge nytt försök.
+      if (signal?.aborted) throw new DOMException('Avbrutet', 'AbortError');
       if (e.fatal) throw e;
-      lastErr = e.name === 'TimeoutError' ? new Error('servern svarade inte i tid') : e;
+      lastErr = (e.name === 'TimeoutError' || e.name === 'AbortError') ? new Error('servern svarade inte i tid') : e;
     }
   }
   throw new Error(`Ett segment gick inte att hämta efter ${RETRIES + 1} försök (${lastErr?.message || lastErr}).`);

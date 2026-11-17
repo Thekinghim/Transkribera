@@ -329,7 +329,7 @@ async function startTranscription() {
   let processed = 0;      // sekunder ljud transkriberat i den här körningen
   let ticker = null;
   try {
-    src = await openAudioSource(state.file);
+    src = await openAudioSource(state.file, { onProgress: (f) => setStatus(`Läser in filen… ${Math.round(f * 100)} %`) });
     lec.duration = src.duration;
     updateProgress(lec.cursor / lec.duration);
     $('progressTitle').textContent = 'Laddar modellen…';
