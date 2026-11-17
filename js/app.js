@@ -4,7 +4,7 @@ import {
   fmtTime, fmtDuration, cleanSegments, isCue, keywords, chapters, paragraphs, makeCards,
   PROMPTS, transcriptForAI, toTXT, toSRT, toMarkdown, toWordHTML, escapeHtml, escapeRe, newId,
 } from './study.js';
-import { createEngine, releaseWorkers, forgetBackendMemory, gpuRemembered, isGarbageText } from './engine.js';
+import { createEngine, releaseWorkers, forgetBackendMemory, gpuRemembered, webgpuUsable, isGarbageText } from './engine.js';
 import { hasKey, setKey, testKey, streamAnswer, generateCards, gradeAnswer, renderMarkdown, estimateCostSEK, parseTimestamp } from './ai.js';
 
 const $ = (id) => document.getElementById(id);
@@ -89,8 +89,7 @@ async function saveNow() {
 async function showSysInfo() {
   const el = $('sysinfo');
   const parts = [];
-  let gpu = false;
-  try { gpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch {}
+  const gpu = await webgpuUsable();   // samma bedömning som motorn gör (mjukvaru-WebGPU räknas inte)
   parts.push(gpu
     ? '<span class="ok">✓ Grafikkortet (WebGPU) kan användas</span> – snabb transkribering.'
     : '<span class="warn">WebGPU saknas</span> – det fungerar ändå, men långsammare (processorn används).');

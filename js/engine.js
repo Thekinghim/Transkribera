@@ -65,6 +65,8 @@ function hasWebGPU(allowSoftware = false) {
   })();
   return webgpuProbe.then(a => !!a && (allowSoftware || !a.software));
 }
+/** Kan grafikkortet användas för transkribering på den här datorn? */
+export function webgpuUsable() { return hasWebGPU(globalThis.__transkriberaTuning?.allowSoftwareGpu); }
 
 // ---------------------------------------------------------------- ljudläsare
 /** Läser framåt i källan i större bitar och håller en begränsad buffert framför läspositionen. */
@@ -423,13 +425,13 @@ class Engine {
    */
   async _transcribeWindow(win, activeS, describe) {
     let restarts = 0, hardFails = 0, retriedSoft = false, gen = {};
+    const began = performance.now();   // all tid som går åt till fönstret räknas, även omstarter och omräkningar
     for (;;) {
       this._checkStop();
       await this._ensurePrimary();
       this._status(describe(this.backend), 'running');
       const b = this.backend, st = this._stat(b.id), isLast = this.bi === this.chain.length - 1;
       let r;
-      const t0 = performance.now();
       try {
         r = await this._runOn(this.primary, b, win, gen);
       } catch (e) {
@@ -447,7 +449,7 @@ class Engine {
         this._loadNote = hang ? 'Modellen svarade inte' : 'Modellen kraschade';
         continue;
       }
-      const wallMs = performance.now() - t0;
+      const wallMs = performance.now() - began;
       st.windows++;
       const text = joinText(r.pieces);
       const v = checkWindow({ text, activeS, hitMax: r.stats.hitMax, avgLogprob: r.stats.avgLogprob });
@@ -460,8 +462,7 @@ class Engine {
         if (v.hard) { this._fallback(b, 'garbage', true); continue; }
         if (!st.trusted && this.t.verify) {
           const out = await this._verify(win, activeS, r, v, b, st);
-          if (out) return { ...out, wallMs: performance.now() - t0 };
-          continue;   // motorn byttes: gör om fönstret på den nya
+          return { ...out, wallMs: performance.now() - began };
         }
       } else if (v.hard) {
         // skräp även från sista motorn: starta om en gång, ge sedan upp utan att spara något
@@ -474,13 +475,14 @@ class Engine {
         retriedSoft = true; gen = { noRepeatNgram: 3 };   // gör om med spärr mot upprepningar
         continue;
       }
-      return { pieces: salvage(r.pieces, v), wallMs, stats: r.stats, verdict: v };
+      return { pieces: salvage(r.pieces, v), wallMs: performance.now() - began, stats: r.stats, verdict: v };
     }
   }
 
   /**
    * Misstänkt text från grafikkortet: räkna om fönstret på nästa motor och jämför.
-   * Returnerar bitarna som ska sparas, eller null om aktiv motor byttes ut (fönstret görs då om).
+   * Returnerar bitarna som ska sparas. Ger kontrollen upprepat rätt och grafikkortet fel väljs
+   * grafikkortet bort; är de överens beror det på ljudet och grafikkortet behålls.
    */
   async _verify(win, activeS, r, v, b, st) {
     const nb = this.chain[this.bi + 1];
