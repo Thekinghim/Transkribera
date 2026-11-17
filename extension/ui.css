@@ -100,3 +100,4 @@ input[type=text]:focus, select:focus { outline: 2px solid var(--accent); outline
 }
 .notice.error { background: var(--danger-soft); color: var(--danger); }
 .notice.ok { background: var(--ok-soft); color: var(--ok); }
+[hidden] { display: none !important; }

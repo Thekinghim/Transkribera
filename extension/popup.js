@@ -139,14 +139,29 @@ function hlsCard(item) {
   const select = el('select', { 'aria-label': 'Kvalitet' });
   if (h.type === 'master' && h.variants?.length) {
     const sorted = [...h.variants].sort((a, b) => b.bandwidth - a.bandwidth);
+    const audioGroups = new Set((h.audio || []).map(a => a.groupId));
+    let separateAudio = false;
     sorted.forEach((v, i) => {
       const est = v.bandwidth && h.duration ? ` (ca ${formatBytes(v.bandwidth * h.duration / 8)})` : '';
-      select.append(el('option', { value: v.uri }, (i === 0 ? 'Bästa: ' : '') + variantLabel(v) + est));
+      // Ljudet ligger i en egen ström => videofilen blir utan ljud.
+      const noAudio = v.audio && audioGroups.has(v.audio);
+      if (noAudio) separateAudio = true;
+      select.append(el('option', { value: v.uri, title: variantLabel(v) }, (i === 0 ? 'Bästa: ' : '') + variantLabel(v, true) + est + (noAudio ? ' – utan ljud' : '')));
     });
     const audio = pickAudioOnly({ variants: h.variants, media: (h.audio || []).map(a => ({ ...a, type: 'AUDIO' })) });
-    if (audio) select.append(el('option', { value: 'audio' }, 'Bara ljud (minst fil, räcker för transkribering)'));
+    if (audio) {
+      const opt = el('option', { value: 'audio' }, 'Bara ljud (minst fil, räcker för transkribering)');
+      select.append(opt);
+      if (separateAudio) {
+        opt.selected = true;
+        card.append(el('div', { class: 'notice' }, 'Den här strömmen har ljud och bild i separata delar. För transkribering: välj ”Bara ljud”. Videoalternativen sparas utan ljud.'));
+      }
+    }
   } else {
-    select.append(el('option', { value: 'best' }, 'Enda tillgängliga kvalitet'));
+    select.append(el('option', { value: 'best' }, h.type === 'media' ? 'Video och ljud' : 'Enda tillgängliga kvalitet'));
+    if (h.type === 'media' && h.format === 'ts') {
+      select.append(el('option', { value: 'audio' }, 'Bara ljud (minst fil, räcker för transkribering)'));
+    }
   }
   const btn = el('button', { class: 'btn primary' }, 'Ladda ner');
   const status = el('span', { class: 'status' });

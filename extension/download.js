@@ -29,6 +29,8 @@ async function pickerWriter(suggestedName, ext) {
 }
 
 async function opfsWriter(name) {
+  // Testläge: OPFS i headless Chromium klarar inte alltid icke-ASCII-namn, så förenkla namnet.
+  name = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w.-]+/g, '_');
   const root = await navigator.storage.getDirectory();
   const fh = await root.getFileHandle(name, { create: true });
   const w = await fh.createWritable();
@@ -107,6 +109,10 @@ async function resolveJob(job) {
     pl = parsePlaylist(sub.text, sub.url);
     if (pl.type !== 'media') throw new Error('Oväntad spellista (nästlad huvudspellista).');
   }
+  else if (job.choice === 'audio') {
+    // En enda spellista: ljudet plockas ur TS-segmenten om det går.
+    audioOnly = true; audioKind = 'same-stream'; label = 'Bara ljud';
+  }
   if (pl.encrypted) return { encrypted: pl.encrypted };
   if (!pl.segments.length) throw new Error('Spellistan innehåller inga segment.');
   return { playlist: pl, label, audioOnly, audioKind };
@@ -160,7 +166,10 @@ async function main() {
   if (pl.segments[0].map) format = 'fmp4';
 
   let ext, mode = 'copy';
-  if (format === 'fmp4') ext = r.audioOnly && r.audioKind !== 'lowest-variant' ? 'm4a' : 'mp4';
+  if (format === 'fmp4') {
+    ext = r.audioOnly && (r.audioKind === 'audio-rendition' || r.audioKind === 'audio-variant') ? 'm4a' : 'mp4';
+    if (r.audioOnly && ext === 'mp4') r.label = 'Ljud och bild (ljudet går inte att separera i den här strömmen)';
+  }
   else if (format === 'packed') ext = /\.mp3(\?|$)/i.test(pl.segments[0].uri) ? 'mp3' : 'aac';
   else {
     ext = 'ts';
@@ -189,7 +198,7 @@ async function main() {
     return [dt, dd];
   }));
   if (ext === 'ts') {
-    showMessage('Strömmen sparas som .ts (MPEG-TS). Den spelas i t.ex. VLC. För transkribering räcker ”Bara ljud”, som ger en mindre ljudfil.');
+    showMessage('Strömmen sparas som .ts (MPEG-TS), som spelas i t.ex. VLC. För transkribering räcker ”Bara ljud”, som ger en mycket mindre ljudfil.');
   }
 
   const fileName = `${name}.${ext}`;
@@ -300,9 +309,9 @@ async function run({ pl, firstBytes, mode, ext, fileName }, writer) {
     $('doneCard').hidden = false;
     const secs = (performance.now() - t0) / 1000;
     $('doneText').textContent =
-      `Klart! ”${writer.name}” är sparad (${formatBytes(written)}, ${N} segment på ${formatDuration(secs) || 'under 1 s'}). ` +
+      `Klart! ”${writer.name}” är sparad (${formatBytes(written)}, ${N} segment på ${secs < 1 ? 'under 1 s' : formatDuration(secs)}). ` +
       (ext === 'ts'
-        ? 'Filen är i .ts-format – välj ”Bara ljud” om du vill ha en fil som passar för transkribering.'
+        ? 'Filen är i .ts-format. Transkribera kan läsa .ts-filer upp till 400 MB – för längre föreläsningar, välj ”Bara ljud” (mycket mindre fil).'
         : 'Öppna Transkribera och välj filen för att transkribera föreläsningen.');
     document.title = `Klart – ${fileName}`;
     window.__result = { status: 'done', file: writer.name, written, downloaded, segments: N, ext, mode };

@@ -135,10 +135,10 @@ export function pickAudioOnly(master) {
   return null;
 }
 
-export function variantLabel(v) {
+export function variantLabel(v, short = false) {
   const parts = [];
   if (v.height) parts.push(`${v.height}p`);
-  if (v.width && v.height) parts.push(`${v.width}×${v.height}`);
+  if (v.width && v.height && !short) parts.push(`${v.width}×${v.height}`);
   if (v.bandwidth) parts.push(formatBitrate(v.bandwidth));
   if (!parts.length) parts.push('okänd kvalitet');
   return parts.join(' · ');

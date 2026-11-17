@@ -118,7 +118,7 @@ async function addItem(tabId, data) {
   } else {
     t.items[key] = {
       key, url: data.url, kind: data.kind, mime: data.mime || '', size: data.size ?? null,
-      ext: extOf(data.url), source: data.source, seen: Date.now(), pageUrl: data.pageUrl || '',
+      ext: extOf(data.url), source: data.source, seen: data.time || Date.now(), pageUrl: data.pageUrl || '',
     };
   }
   try {
@@ -216,14 +216,19 @@ chrome.webRequest.onHeadersReceived.addListener(details => {
   const size = kind === 'direct' ? totalSize(details) : null;
   // Små filer ignoreras (men bara när storleken är känd).
   if (kind === 'direct' && size != null && size < MIN_SIZE) return;
-  addItem(details.tabId, { url: details.url, kind, mime: ct, size, source: 'net', pageUrl: details.documentUrl || '' });
+  addItem(details.tabId, { url: details.url, kind, mime: ct, size, source: 'net', pageUrl: details.documentUrl || '', time: details.timeStamp });
 }, { urls: ['<all_urls>'] }, ['responseHeaders']);
 
-// Ny sida i fliken => töm listan.
+// Ny sida i fliken => töm listan. Händelser kan komma i oväntad ordning när
+// service workern just startat, så bara poster som syntes före navigeringen tas bort.
 chrome.webRequest.onBeforeRequest.addListener(details => {
   if (details.type !== 'main_frame' || details.tabId < 0) return;
+  const navTime = details.timeStamp || Date.now();
   ready.then(() => {
-    delete state[details.tabId];
+    const t = state[details.tabId];
+    if (!t) return;
+    for (const [k, it] of Object.entries(t.items)) if (it.seen < navTime) delete t.items[k];
+    if (!Object.keys(t.items).length) delete state[details.tabId];
     save(details.tabId);
     updateBadge(details.tabId);
   });

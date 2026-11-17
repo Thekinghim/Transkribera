@@ -614,6 +614,8 @@ class TsAudioSource {
     const mask = new Uint8Array(8192);
     mask[0] = 1;
     let pmtPid = -1, audioPid = -1, streamType = 0, unsupported = null;
+    const candidates = [];
+    const disc = []; // index för PES-paket efter ett tidshopp (t.ex. hopklistrade strömmar)
     const offsets = new Grow(Float64Array), times = new Grow(Float64Array);
     let prevRaw = -1, prevT = 0, lastDelta = 0;
 
@@ -623,6 +625,14 @@ class TsAudioSource {
       const pl = tsPayload(buf, p);
       if (pl < 0) return;
       const end = p + 188;
+      if (audioPid < 0 && candidates.includes(pid)) {
+        // stream_type 0x06 (privat data, t.ex. AAC i M2TS från ffmpeg): titta om nyttolasten är ADTS
+        const q = pl + 9 + buf[pl + 8];
+        if (buf[pl] === 0 && buf[pl + 1] === 0 && buf[pl + 2] === 1 && q + 1 < end &&
+            buf[q] === 0xff && (buf[q + 1] & 0xf6) === 0xf0) {
+          audioPid = pid; streamType = 0x0f;
+        }
+      }
       if (pid === audioPid) {
         // PES-huvud: 00 00 01 id len(2) flaggor(2) huvudlängd PTS(5)
         if (pl + 14 > end || buf[pl] !== 0 || buf[pl + 1] !== 0 || buf[pl + 2] !== 1) return;
@@ -633,7 +643,7 @@ class TsAudioSource {
         else {
           let d = raw - prevRaw;
           if (d < -4294967296) d += 8589934592; else if (d > 4294967296) d -= 8589934592; // 33-bitars omslag
-          if (d < 0 || d > 90000 * 10) d = lastDelta; // diskontinuitet (t.ex. hopklistrade strömmar)
+          if (d < 0 || d > 90000 * 10) { d = lastDelta; disc.push(offsets.n); } // diskontinuitet, rättas nedan
           else lastDelta = d;
           t = prevT + d / 90000;
         }
@@ -655,8 +665,19 @@ class TsAudioSource {
         while (q + 5 <= secEnd) {
           const st = buf[q], epid = ((buf[q + 1] & 0x1f) << 8) | buf[q + 2];
           if (TS_AUDIO_TYPES[st]) { audioPid = epid; streamType = st; mask[audioPid] = 1; break; }
-          if (TS_UNSUPPORTED_AUDIO[st] && !unsupported) unsupported = TS_UNSUPPORTED_AUDIO[st];
-          q += 5 + (((buf[q + 3] & 0x0f) << 8) | buf[q + 4]);
+          const esEnd = q + 5 + (((buf[q + 3] & 0x0f) << 8) | buf[q + 4]);
+          let known = TS_UNSUPPORTED_AUDIO[st];
+          if (st === 0x06) {
+            // deskriptorer som avslöjar formatet: AC-3, E-AC-3, DTS, undertext, text-TV
+            for (let d = q + 5; d + 2 <= esEnd; d += 2 + buf[d + 1]) {
+              const tag = buf[d];
+              if (tag === 0x6a) known = 'AC-3'; else if (tag === 0x7a) known = 'E-AC-3'; else if (tag === 0x7b) known = 'DTS';
+              else if (tag === 0x59 || tag === 0x56) known = 'ingen';
+            }
+            if (!known && !candidates.includes(epid)) { candidates.push(epid); mask[epid] = 1; }
+          }
+          if (known && known !== 'ingen' && !unsupported) unsupported = known;
+          q = esEnd;
         }
       }
     }, (pos) => { if (this.onProgress) this.onProgress(pos / file.size); });
@@ -679,6 +700,18 @@ class TsAudioSource {
     this.times = times.done();
     this.pesCount = this.offsets.length;
     const n = this.pesCount;
+
+    // Vid tidshopp: lägg det nya PES-paketet direkt efter sista ramen i föregående paket,
+    // och flytta alla följande tider lika mycket.
+    for (let d = 0; d < disc.length; d++) {
+      const k = disc[d], segEnd = d + 1 < disc.length ? disc[d + 1] : n;
+      let lastEnd = -Infinity;
+      await this.demux(k - 1, this.offsets[k], (data, t, f) => { lastEnd = Math.max(lastEnd, t + f.dur); });
+      if (lastEnd === -Infinity) continue;
+      const shift = lastEnd - this.times[k];
+      for (let j = k; j < segEnd; j++) this.times[j] += shift;
+    }
+    this.discontinuities = disc.length;
 
     // Första ramen ger avkodarens inställningar
     let first = null;
