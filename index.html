@@ -166,21 +166,63 @@
   </div>
 </main>
 
-<!-- ============ AI-DIALOG ============ -->
-<dialog id="aiDialog" class="dialog">
-  <form method="dialog" class="dialog-inner">
-    <div class="dialog-head"><h2>✨ Plugga med AI</h2><button class="icon-btn" value="close" aria-label="Stäng">✕</button></div>
-    <p class="muted">Välj vad du vill ha hjälp med. Instruktionen och texten kopieras, och claude.ai öppnas i en ny flik – klistra in med <kbd>Ctrl</kbd>+<kbd>V</kbd> och tryck Enter.</p>
-    <fieldset class="scope">
-      <legend>Vilken text?</legend>
-      <label><input type="radio" name="scope" value="all" checked> Hela föreläsningen</label>
-      <label><input type="radio" name="scope" value="chapter"> Avsnittet som spelas nu <span class="muted" id="scopeChapterName"></span></label>
-      <label><input type="radio" name="scope" value="star"> Bara stjärnmärkt</label>
-    </fieldset>
-    <div class="ai-grid" id="aiGrid"></div>
-    <p class="muted tiny" id="aiInfo"></p>
+<!-- ============ PLUGGASSISTENT (Claude) ============ -->
+<aside id="aiDrawer" class="drawer" aria-hidden="true" aria-label="Pluggassistent">
+  <div class="drawer-head">
+    <h2>✨ Pluggassistent</h2>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="aiSettingsBtn" title="Inställningar">⚙️</button>
+    <button class="icon-btn" id="aiClose" title="Stäng (Esc)">✕</button>
+  </div>
+
+  <!-- inställningar / ingen nyckel -->
+  <section id="aiSetup" class="drawer-section hidden">
+    <h3>Koppla in Claude</h3>
+    <p>Med en egen API-nyckel svarar Claude direkt här – sammanfattningar, förhörskort, tentafrågor och svar på dina frågor om föreläsningen.</p>
+    <ol class="steps">
+      <li>Logga in på <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> och skapa en API-nyckel.</li>
+      <li>Fyll på några kronor under <i>Billing</i> (en hel föreläsning kostar ungefär 2–6 kr att sammanfatta).</li>
+      <li>Klistra in nyckeln här:</li>
+    </ol>
+    <form id="aiKeyForm" class="key-form" autocomplete="off">
+      <input type="password" id="aiKeyInput" placeholder="sk-ant-…" spellcheck="false" autocomplete="off">
+      <button class="btn primary" type="submit">Spara</button>
+    </form>
+    <p class="muted tiny">🔒 Nyckeln sparas bara i den här webbläsaren och skickas bara direkt till Anthropic. Använd den inte på en dator som andra har tillgång till.</p>
+    <div id="aiKeyStatus" class="tiny"></div>
+    <div class="key-actions hidden" id="aiKeyActions">
+      <button class="btn small" id="aiKeyRemove">Ta bort nyckeln</button>
+      <button class="btn small primary" id="aiSetupDone">Klar</button>
+    </div>
+    <details class="fallback">
+      <summary>Utan API-nyckel: använd claude.ai gratis</summary>
+      <p class="muted tiny">Kopierar instruktion + text och öppnar claude.ai där du klistrar in (Ctrl+V).</p>
+      <div class="ai-grid compact" id="aiCopyGrid"></div>
+    </details>
+  </section>
+
+  <!-- huvudvy -->
+  <section id="aiMain" class="drawer-body hidden">
+    <div class="ai-scope">
+      <span class="muted tiny">Fokus:</span>
+      <div class="toggle-group" role="group" aria-label="Fokus">
+        <button class="tg active" data-scope="all">Hela</button>
+        <button class="tg" data-scope="chapter" id="scopeChapterBtn">Avsnittet nu</button>
+        <button class="tg" data-scope="star">⭐ Markerat</button>
+      </div>
+    </div>
+    <div class="ai-grid" id="aiTools"></div>
+
+    <div id="aiThread" class="ai-thread"></div>
+  </section>
+
+  <form id="aiAsk" class="ai-ask hidden">
+    <textarea id="aiQuestion" rows="1" placeholder="Fråga något om föreläsningen…  (Enter skickar)"></textarea>
+    <button class="btn primary" id="aiSend" type="submit">Skicka</button>
+    <button class="btn hidden" id="aiStop" type="button">Stoppa</button>
   </form>
-</dialog>
+</aside>
+<div id="drawerShade" class="drawer-shade hidden"></div>
 
 <!-- ============ FÖRHÖR ============ -->
 <dialog id="quizDialog" class="dialog">

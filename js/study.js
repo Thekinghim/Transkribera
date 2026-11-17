@@ -14,17 +14,23 @@ function srtTime(sec) {
 }
 export function fmtDuration(sec) {
   sec = Math.round(sec || 0);
-  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
-  if (h) return `${h} h ${m} min`;
+  const tm = Math.round(sec / 60), h = Math.floor(tm / 60), m = tm % 60;
+  if (h) return m ? `${h} h ${m} min` : `${h} h`;
   if (sec >= 60) return `${Math.max(1, Math.round(sec / 60))} min`;
   return `${sec} s`;
 }
 
 // ---------- rensning av modellens utdata ----------
+// Typiska Whisper-hallucinationer från undertextade träningsdata. Matchar bara hela, korta segment
+// så att riktigt tal som råkar innehålla orden aldrig försvinner.
 const JUNK = [
-  /textning\.nu/i, /undertext(er|ning)?\s+(av|från)/i, /amara\.org/i, /svensktextning/i,
-  /^tack för (att ni|att du) (tittade|lyssnade)/i, /^www\.[^\s]+$/i, /^\W*$/,
-  /prenumerera/i, /^musik$/i, /^\[.*\]$/, /^\(.*\)$/,
+  /^(svensk )?textning(\.nu)?( av [^.]{0,40})?[.!]?$/i,
+  /^undertext(er|ning)? (av|från) [^.]{0,60}[.!]?$/i,
+  /amara\.org/i, /^svensktextning/i,
+  /^tack för (att ni|att du) (tittade|lyssnade|tittat|lyssnat)[.!]?$/i,
+  /^www\.[^\s]+$/i, /^\W*$/,
+  /^(glöm inte att )?prenumerera( på (kanalen|min kanal))?[.!]?$/i,
+  /^musik[.!]?$/i, /^\[[^\]]{0,30}\]$/, /^\([^)]{0,30}\)$/,
 ];
 
 let segCounter = 0;
@@ -54,7 +60,8 @@ const round2 = x => Math.round(x * 100) / 100;
 function norm(t) { return t.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '').trim(); }
 // "och så och så och så och så" -> korta ner upprepningar av samma fras
 function dedupeRepeats(text) {
-  return text.replace(/(\b[\p{L}\p{N}][^.!?]{0,40}?)(?:[\s,]+\1){3,}/giu, '$1');
+  // kräver ordgräns efter varje upprepning och minst 5 upprepningar, så att vanliga ord/tal aldrig ändras
+  return text.replace(/(?<![\p{L}\p{N}])([\p{L}][^.!?]{1,40}?)(?:[\s,]+\1(?![\p{L}\p{N}])){4,}/giu, '$1');
 }
 
 // ---------- viktigt-signaler ----------
@@ -264,12 +271,12 @@ Förklara vad föreläsaren går igenom i det här utdraget så att jag verklige
   },
 };
 
-export function transcriptForAI(segments, title) {
+export function transcriptForAI(segments, title, { stars = true } = {}) {
   const withHours = segments.some(s => s.s >= 3600);
   const lines = paragraphs(segments).map(p =>
-    `[${fmtTime(p[0].s, withHours)}] ` + p.map(s => s.t + (s.star ? ' ⭐' : '')).join(' ')
+    `[${fmtTime(p[0].s, withHours)}] ` + p.map(s => s.t + (stars && s.star ? ' ⭐' : '')).join(' ')
   );
-  return `Föreläsning: ${title}\n(⭐ = markerat som viktigt av mig)\n\n` + lines.join('\n\n');
+  return `Föreläsning: ${title}\n${stars ? '(⭐ = markerat som viktigt av mig)\n' : ''}\n` + lines.join('\n\n');
 }
 
 // ---------- export ----------
@@ -290,7 +297,7 @@ export function toMarkdown(segments, title, chaps, notesInline = true) {
   let md = `# ${title}\n\n`;
   const starred = segments.filter(s => s.star);
   if (starred.length) {
-    md += `## ⭐ Viktiga delar\n\n` + starred.map(s => `- **[${fmtTime(s.s, withHours)}]** ${s.t}${s.note ? `\n  - *Anteckning:* ${s.note}` : ''}`).join('\n') + '\n\n';
+    md += `## ⭐ Viktiga delar\n\n` + starred.map(s => `- **[${fmtTime(s.s, withHours)}]** ${s.t}${s.note ? `\n  - *Anteckning:* ${s.note.replace(/\n+/g, ' ')}` : ''}`).join('\n') + '\n\n';
   }
   const chs = chaps?.length ? chaps : [{ from: 0, to: segments.length, title: 'Transkript', start: 0 }];
   md += `## Innehåll\n\n` + chs.map((c, i) => `${i + 1}. ${c.title} (${fmtTime(c.start, withHours)})`).join('\n') + '\n\n';
@@ -298,7 +305,7 @@ export function toMarkdown(segments, title, chaps, notesInline = true) {
     md += `## ${c.title} — ${fmtTime(c.start, withHours)}\n\n`;
     for (const p of paragraphs(segments.slice(c.from, c.to))) {
       md += `**[${fmtTime(p[0].s, withHours)}]** ` + p.map(s => (s.star ? `**${s.t}**` : s.t)).join(' ') + '\n\n';
-      if (notesInline) for (const s of p) if (s.note) md += `> 📝 ${s.note}\n\n`;
+      if (notesInline) for (const s of p) if (s.note) md += s.note.split('\n').map((l, k) => `> ${k ? '' : '📝 '}${l}`).join('\n') + '\n\n';
     }
   }
   return md;
@@ -312,19 +319,20 @@ export function toWordHTML(segments, title, chaps) {
   const starred = segments.filter(s => s.star);
   if (starred.length) {
     body += `<h2>Viktiga delar</h2><ul>` + starred.map(s =>
-      `<li><b>[${fmtTime(s.s, withHours)}]</b> ${esc(s.t)}${s.note ? `<br><i>Anteckning: ${esc(s.note)}</i>` : ''}</li>`).join('') + '</ul>';
+      `<li><b>[${fmtTime(s.s, withHours)}]</b> ${esc(s.t)}${s.note ? `<br><i>Anteckning: ${esc(s.note).replace(/\n/g, '<br>')}</i>` : ''}</li>`).join('') + '</ul>';
   }
   for (const c of chs) {
     body += `<h2>${esc(c.title)} <span style="color:#888;font-weight:normal">${fmtTime(c.start, withHours)}</span></h2>`;
     for (const p of paragraphs(segments.slice(c.from, c.to))) {
       body += `<p><span style="color:#888">[${fmtTime(p[0].s, withHours)}]</span> ` +
         p.map(s => s.star ? `<b style="background:#fff3b0">${esc(s.t)}</b>` : esc(s.t)).join(' ') + '</p>';
-      for (const s of p) if (s.note) body += `<p style="margin-left:2em;color:#555"><i>Anteckning: ${esc(s.note)}</i></p>`;
+      for (const s of p) if (s.note) body += `<p style="margin-left:2em;color:#555"><i>Anteckning: ${esc(s.note).replace(/\n/g, '<br>')}</i></p>`;
     }
   }
   return `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
 <head><meta charset="utf-8"><title>${esc(title)}</title>
-<style>body{font-family:Calibri,Arial,sans-serif;font-size:11pt;line-height:1.5}h1{font-size:20pt}h2{font-size:14pt;margin-top:18pt}</style></head>
+<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml><![endif]-->
+<style>@page{size:21cm 29.7cm;margin:2.5cm}body{font-family:Calibri,Arial,sans-serif;font-size:11pt;line-height:1.5}h1{font-size:20pt}h2{font-size:14pt;margin-top:18pt}</style></head>
 <body>${body}</body></html>`;
 }
 

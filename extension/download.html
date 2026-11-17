@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hämtar föreläsning – Transkribera</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="download.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="brand">
+      <img src="icons/icon48.png" alt="">
+      <h1>Hämta föreläsning<small>Transkribera</small></h1>
+    </header>
+
+    <section class="card" id="infoCard">
+      <h2 id="fileTitle">Förbereder…</h2>
+      <dl id="facts"></dl>
+      <div id="message" class="notice" hidden></div>
+      <div class="actions">
+        <button class="btn primary" id="start" hidden>Välj var filen ska sparas och starta</button>
+        <button class="btn danger" id="cancel" hidden>Avbryt</button>
+      </div>
+    </section>
+
+    <section class="card" id="progressCard" hidden>
+      <div class="bar"><div id="bar"></div></div>
+      <div class="stats">
+        <div><span class="muted small">Segment</span><strong id="segs">0 / 0</strong></div>
+        <div><span class="muted small">Hämtat</span><strong id="mb">0 MB</strong></div>
+        <div><span class="muted small">Hastighet</span><strong id="speed">–</strong></div>
+        <div><span class="muted small">Tid kvar</span><strong id="eta">–</strong></div>
+      </div>
+      <p class="muted small" id="keepOpen">Låt den här fliken vara öppen tills nedladdningen är klar. Du kan använda andra flikar under tiden.</p>
+    </section>
+
+    <section class="card" id="doneCard" hidden>
+      <p id="doneText"></p>
+      <a class="btn primary" href="https://thekinghim.github.io/Transkribera/" target="_blank" rel="noopener">Öppna Transkribera</a>
+    </section>
+  </div>
+  <script type="module" src="download.js"></script>
+</body>
+</html>
