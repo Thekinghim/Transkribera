@@ -2,8 +2,9 @@ import { openAudioSource, UserFacingError, formatBytes } from './audio.js';
 import { db, fileKey, requestPersistence } from './db.js';
 import {
   fmtTime, fmtDuration, cleanSegments, isCue, keywords, chapters, paragraphs, makeCards,
-  PROMPTS, transcriptForAI, toTXT, toSRT, toMarkdown, toWordHTML, escapeHtml, escapeRe,
+  PROMPTS, transcriptForAI, toTXT, toSRT, toMarkdown, toWordHTML, escapeHtml, escapeRe, newId,
 } from './study.js';
+import { hasKey, setKey, testKey, streamAnswer, generateCards, gradeAnswer, renderMarkdown, estimateCostSEK, parseTimestamp } from './ai.js';
 
 const BLOCK_SECONDS = 300;       // avkoda och transkribera ca 5 min åt gången
 const $ = (id) => document.getElementById(id);
@@ -47,7 +48,7 @@ function getWorker() {
       downloads.set(m.file, { loaded: m.loaded, total: m.total });
       let l = 0, t = 0;
       for (const d of downloads.values()) { l += d.loaded; t += d.total; }
-      setStatus(`Laddar ner modellen (bara första gången): ${Math.round(100 * l / t)} % av ${formatBytes(t)}`);
+      if (!state.running || $('progressTitle').textContent !== 'Transkriberar…') setStatus(`Laddar modellen: ${Math.round(100 * l / t)} % av ${formatBytes(t)} (laddas ner första gången, sedan sparad i webbläsaren)`);
     } else if (m.type === 'status') {
       setStatus(m.text);
     } else if (m.type === 'ready') {
@@ -109,6 +110,7 @@ function download(name, content, type) {
 }
 function safeName(s) { return (s || 'transkript').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120); }
 function selectedModel() { return document.querySelector('input[name=model]:checked')?.value || 'base'; }
+function sameFile(file, lec) { return !!file && !!lec && file.name === lec.name && file.size === lec.size; }
 function segs() { return state.lecture?.segments || []; }
 function withHours() { return (state.lecture?.duration || 0) >= 3600; }
 
@@ -163,6 +165,17 @@ async function renderLibrary() {
     return;
   }
   list.innerHTML = '';
+  // repetition över alla föreläsningar
+  let dueTotal = 0, newTotal = 0;
+  for (const lec of items) { const d = dueInfo(lec); dueTotal += d.due.length; newTotal += Math.min(5, d.fresh.length); }
+  if (dueTotal + newTotal) {
+    const r = document.createElement('div');
+    r.className = 'card review-banner';
+    r.innerHTML = `<div><b>🧠 Repetera idag</b><span class="muted">${dueTotal ? `${dueTotal} kort är redo för repetition` : 'Inga repetitioner idag'}${newTotal ? ` · ${newTotal} nya att lära` : ''}. Några minuter om dagen slår en lång plugg-kväll.</span></div>
+      <button class="btn primary">Starta</button>`;
+    r.querySelector('button').onclick = openGlobalReview;
+    list.appendChild(r);
+  }
   for (const lec of items) {
     const pct = lec.duration ? Math.min(100, Math.round(100 * (lec.cursor || 0) / lec.duration)) : 0;
     const stars = (lec.segments || []).filter(s => s.star).length;
@@ -173,6 +186,7 @@ async function renderLibrary() {
         <div class="lib-name"></div>
         <div class="lib-meta">${lec.duration ? fmtDuration(lec.duration) + ' · ' : ''}${new Date(lec.updatedAt || lec.createdAt).toLocaleDateString('sv-SE', { day: 'numeric', month: 'short', year: 'numeric' })}${stars ? ` · ⭐ ${stars}` : ''} · ${lec.model === 'small' ? 'Noggrann' : 'Snabb'}</div>
       </div>
+      ${(() => { const d = dueInfo(lec); return d.due.length ? `<span class="pill due" title="Kort att repetera">🧠 ${d.due.length}</span>` : ''; })()}
       <span class="pill ${lec.done ? 'done' : 'partial'}">${lec.done ? 'Klar' : `Pausad ${pct} %`}</span>
       <button class="btn small">Öppna</button>
       <button class="icon-btn" title="Ta bort">🗑</button>`;
@@ -182,6 +196,7 @@ async function renderLibrary() {
     el.querySelector('.icon-btn').onclick = async () => {
       if (state.running && state.lecture?.id === lec.id) { toast('Pausa transkriberingen först.'); return; }
       if (!confirm(`Ta bort "${lec.title || lec.name}"? Texten och dina markeringar raderas.`)) return;
+      if (state.lecture?.id === lec.id) { clearTimeout(saveTimer); detachFile(); state.lecture = null; }
       await db.delete(lec.id);
       renderLibrary();
     };
@@ -195,6 +210,12 @@ async function handleFile(file) {
   if (state.running) { toast('En transkribering pågår redan. Pausa den först.'); return; }
   const id = fileKey(file);
   let lec = await db.get(id).catch(() => null);
+  if (!lec) {
+    // samma fil men nytt datum (t.ex. nedladdad igen eller kopierad)? Fortsätt på den sparade.
+    const all = await db.all().catch(() => []);
+    const twin = all.find(x => x.name === file.name && x.size === file.size);
+    if (twin && confirm(`Du har redan "${twin.title || twin.name}" sparad. Öppna den (och fortsätt där du var) i stället för att börja om?`)) lec = twin;
+  }
   if (!lec) {
     lec = {
       id, name: file.name, size: file.size, lastModified: file.lastModified,
@@ -210,8 +231,9 @@ async function handleFile(file) {
 
 async function openLecture(lec, file = null) {
   if (state.running && state.lecture?.id !== lec.id) { toast('En transkribering pågår. Pausa den först.'); return; }
-  if (state.lecture?.id !== lec.id) {
-    detachFile();
+  if (state.lecture !== lec) {
+    if (state.lecture?.id !== lec.id) { detachFile(); $('progressCard').classList.add('hidden'); }
+    if (drawerOpen()) closeDrawer();
     state.lecture = lec;
     state.search = ''; $('searchInput').value = '';
     state.keyword = null;
@@ -226,9 +248,8 @@ async function openLecture(lec, file = null) {
 }
 
 function attachFile(file) {
-  if (state.lecture && fileKey(file) !== state.lecture.id) {
-    // samma föreläsning men annan fil – tillåt för uppspelning om namnet/storleken stämmer ungefär
-    if (file.size !== state.lecture.size) {
+  if (state.lecture && !sameFile(file, state.lecture)) {
+    {
       if (!confirm('Den här filen verkar inte vara samma som föreläsningen transkriberades från. Koppla den ändå för uppspelning?')) return false;
     }
   }
@@ -259,11 +280,11 @@ function updateResumeCard() {
   const card = $('resumeCard');
   if (!lec || lec.done || state.running) { card.classList.add('hidden'); return; }
   const pct = lec.duration ? Math.round(100 * lec.cursor / lec.duration) : 0;
-  $('resumeText').textContent = state.file && fileKey(state.file) === lec.id
+  $('resumeText').textContent = state.file && sameFile(state.file, lec)
     ? `Transkriberingen är pausad vid ${pct} %.`
     : `Transkriberingen är pausad vid ${pct} %. Välj samma fil (${lec.name}) igen för att fortsätta där du slutade.`;
   const label = card.querySelector('label');
-  if (state.file && fileKey(state.file) === lec.id) {
+  if (state.file && sameFile(state.file, lec)) {
     label.firstChild.textContent = 'Fortsätt transkribera';
   } else {
     label.firstChild.textContent = 'Välj filen och fortsätt';
@@ -278,7 +299,7 @@ async function acquireWakeLock() {
     if ('wakeLock' in navigator && document.visibilityState === 'visible') {
       wakeLock = await navigator.wakeLock.request('screen');
       $('wakeInfo').textContent = '☕ Datorn hålls vaken';
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
+      wakeLock.addEventListener('release', () => { wakeLock = null; if (state.running) $('wakeInfo').textContent = '⚠️ Håll fliken öppen och synlig så att datorn inte somnar'; });
     }
   } catch { $('wakeInfo').textContent = ''; }
 }
@@ -290,7 +311,7 @@ document.addEventListener('visibilitychange', () => {
 async function startTranscription() {
   const lec = state.lecture;
   if (!lec || state.running) return;
-  if (!state.file || fileKey(state.file) !== lec.id) { updateResumeCard(); return; }
+  if (!state.file || !sameFile(state.file, lec)) { updateResumeCard(); return; }
   state.running = true;
   state.stopRequested = false;
   updateResumeCard();
@@ -314,7 +335,7 @@ async function startTranscription() {
     $('progressTitle').textContent = 'Laddar modellen…';
     await loadModel(lec.model || 'base');
     $('progressTitle').textContent = 'Transkriberar…';
-    setStatus(workerDevice === 'webgpu' ? 'Använder grafikkortet (WebGPU).' : 'Använder processorn (WASM) – det tar längre tid.');
+    setStatus(workerDevice === 'webgpu' ? 'Använder grafikkortet (WebGPU).' : (lec.model === 'small' ? 'Använder processorn (WASM) – Noggrann blir mycket långsam utan grafikkort. Välj hellre Snabb för nästa föreläsning.' : 'Använder processorn (WASM) – det tar längre tid än med grafikkort.'));
 
     while (lec.cursor < lec.duration - 0.3 && !state.stopRequested) {
       const start = lec.cursor;
@@ -365,6 +386,7 @@ async function startTranscription() {
       updateProgress(1);
       setStatus(`Hela föreläsningen (${fmtDuration(lec.duration)}) är transkriberad.`);
       toast('Transkriberingen är klar 🎉');
+      if (hasKey()) setStatus('Klart! Tips: öppna ✨ Plugga med AI och skapa en sammanfattning och förhörskort direkt.');
       notifyDone(lec);
       setTimeout(() => { if (!state.running) $('progressCard').classList.add('hidden'); }, 8000);
     } else {
@@ -383,6 +405,7 @@ async function startTranscription() {
     state.running = false;
     $('pauseBtn').disabled = true;
     releaseWakeLock();
+    document.title = 'Transkribera – föreläsningar till text';
     renderAll();
     updateResumeCard();
     if (lec.done) $('pauseBtn').disabled = true;
@@ -440,14 +463,13 @@ function visibleIndices() {
 }
 
 function highlight(text) {
-  let html = escapeHtml(text);
   const terms = [];
-  if (state.search.trim()) terms.push(escapeRe(escapeHtml(state.search.trim())));
+  if (state.search.trim()) terms.push(escapeRe(state.search.trim()));
   if (state.keyword) terms.push(...state.keyword.forms.map(f => escapeRe(f)));
-  if (!terms.length) return html;
+  if (!terms.length) return escapeHtml(text);
   const re = new RegExp(`(${terms.join('|')})`, 'giu');
-  // ersätt inte inne i HTML-entiteter
-  return html.split(/(&[a-z#0-9]+;)/i).map(part => part.startsWith('&') && part.endsWith(';') ? part : part.replace(re, '<mark>$1</mark>')).join('');
+  // dela på råtexten och escapa varje bit för sig – då fungerar även sökningar med & < > " '
+  return text.split(re).map((part, k) => k % 2 ? `<mark>${escapeHtml(part)}</mark>` : escapeHtml(part)).join('');
 }
 
 function renderAll() {
@@ -518,6 +540,7 @@ function segHTML(seg, i) {
       <button class="icon-btn star-btn${seg.star ? ' on' : ''}" data-act="star" title="Stjärnmärk (S)">⭐</button>
       <button class="icon-btn" data-act="edit" title="Redigera">✏️</button>
       <button class="icon-btn note-btn${seg.note ? ' on' : ''}" data-act="note" title="Anteckning">📝</button>
+      <button class="icon-btn" data-act="ask" title="Fråga Claude vad som menas här">💬</button>
       <button class="icon-btn" data-act="copy" title="Kopiera med tidsstämpel">📋</button>
     </div>
     ${seg.note ? `<div class="note"><div class="note-view" data-act="note">${escapeHtml(seg.note)}</div></div>` : ''}
@@ -525,6 +548,7 @@ function segHTML(seg, i) {
 }
 
 function renderTranscript() {
+  if (state.editing !== null) { state.pendingRender = true; return; }
   const box = $('transcript');
   const s = segs();
   if (!s.length) {
@@ -582,6 +606,7 @@ function chapterHead(ci) {
 // lägger till nya segment under transkribering utan att rita om allt
 function appendSegments(newSegs) {
   const s = segs();
+  if (state.editing !== null) { state.pendingRender = true; ensureDerived(); renderChapters(); renderKeywords(); updateCounts(); return; }
   if (state.filter !== 'all' || state.keyword || state.search || state.mode !== 'segments' || s.length === newSegs.length) {
     renderAll();
     return;
@@ -662,7 +687,7 @@ function onTime() {
       const el = segElement(idx);
       if (el) {
         el.classList.add('current');
-        if ($('followToggle').checked && !video.paused) scrollToSegment(idx);
+        if ($('followToggle').checked && !video.paused && state.editing === null) scrollToSegment(idx);
       }
       const ci = state.chapters.findIndex(c => idx >= c.from && idx < c.to);
       document.querySelectorAll('#chapterList button').forEach((b, k) => b.classList.toggle('active', k === ci));
@@ -671,28 +696,21 @@ function onTime() {
 }
 let seekDragging = false;
 
-// ---------------------------------------------------------------- AI
-function aiScopeSegments() {
-  const scope = document.querySelector('input[name=scope]:checked')?.value || 'all';
-  const s = segs();
-  if (scope === 'star') return s.filter(x => x.star);
-  if (scope === 'chapter') {
-    const idx = state.currentIdx >= 0 ? state.currentIdx : 0;
-    const c = chapterAt(idx);
-    return c ? s.slice(c.from, c.to) : s;
-  }
-  return s;
-}
-function openAI(promptKey, segList, label) {
+// ---------------------------------------------------------------- AI: utan nyckel (kopiera till claude.ai)
+async function copyToClaude(promptKey, segList, label) {
   if (!segList.length) { toast('Det finns ingen text i det valet än.'); return; }
   const title = state.lecture?.title || 'Föreläsning';
   const text = PROMPTS[promptKey].text + '\n\n---\n\n' + transcriptForAI(segList, title + (label ? ` – ${label}` : ''));
-  const opened = window.open('https://claude.ai/new', '_blank', 'noopener');
-  copyText(text).then(ok => {
-    toast(ok ? 'Kopierat! Klistra in i Claude med Ctrl+V och tryck Enter.' : 'Kunde inte kopiera automatiskt – texten laddas ner som fil i stället.', 5000);
-    if (!ok) download(safeName(title) + ' – AI-prompt.txt', text, 'text/plain;charset=utf-8');
-  });
-  if (!opened) toast('Tillåt popup-fönster för att öppna claude.ai automatiskt.');
+  // kopiera först (inom samma klick), öppna sedan claude.ai
+  const ok = await copyText(text);
+  const w = window.open('https://claude.ai/new', '_blank');
+  if (w) { try { w.opener = null; } catch {} }
+  if (ok) toast('Kopierat! Klistra in i Claude med Ctrl+V och tryck Enter.', 5000);
+  else {
+    download(safeName(title) + ' – AI-prompt.txt', text, 'text/plain;charset=utf-8');
+    toast('Kunde inte kopiera automatiskt – texten laddades ner som fil i stället.', 5000);
+  }
+  if (!w) toast('Tillåt popup-fönster för att öppna claude.ai automatiskt.', 5000);
 }
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); return true; } catch {}
@@ -703,113 +721,438 @@ async function copyText(text) {
     const ok = document.execCommand('copy'); ta.remove(); return ok;
   } catch { return false; }
 }
-function openAIDialog() {
-  const grid = $('aiGrid');
-  const descr = {
-    summary: 'Strukturerad sammanfattning med rubriker, begrepp och tidsstämplar',
-    flashcards: 'Fråga/svar-kort, även i Anki/Quizlet-format',
-    quiz: 'Övningstenta med flerval, kortsvar och essäfrågor + facit',
-    concepts: 'Svåra begrepp förklarade enkelt med exempel',
-    plan: 'Pluggplan med pass och repetition',
-    explain: 'Gå igenom texten steg för steg',
-  };
+
+// ---------------------------------------------------------------- AI: pluggassistent med Claude
+const AI_TOOLS = [
+  { key: 'summary', label: 'Sammanfattning', descr: 'Rubriker, begrepp och tidsstämplar' },
+  { key: 'cards', label: 'Förhörskort', descr: 'Fråga/svar-kort till 🧠 Förhör' },
+  { key: 'quiz', label: 'Övningstenta', descr: 'Flerval, kortsvar, essä + facit' },
+  { key: 'concepts', label: 'Förklara begrepp', descr: 'Enkelt, med exempel' },
+  { key: 'plan', label: 'Pluggplan', descr: 'Pass och repetition' },
+];
+const aiState = { scope: 'all', controller: null, busy: false, chapter: null };
+
+function lecAI() {
+  const l = state.lecture;
+  l.ai = l.ai || { items: [] };
+  return l.ai;
+}
+function aiTranscript() {
+  return transcriptForAI(segs(), state.lecture?.title || 'Föreläsning', { stars: false });
+}
+function focusFor(scope, chapter) {
+  const wh = withHours();
+  if (scope === 'chapter' && chapter) {
+    return { label: `Avsnitt: ${chapter.title}`, text: `Fokusera på avsnittet "${chapter.title}" (${fmtTime(chapter.start, wh)}–${fmtTime(chapter.end, wh)}) i föreläsningen.` };
+  }
+  if (scope === 'star') {
+    const st = segs().filter(x => x.star);
+    if (!st.length) return null;
+    return { label: 'Stjärnmärkta delar', text: 'Fokusera på de delar jag har markerat som viktiga:\n' + st.map(x => `- [${fmtTime(x.s, wh)}] ${x.t}`).join('\n') };
+  }
+  return { label: 'Hela föreläsningen', text: '' };
+}
+function currentChapter() { return aiState.chapter || chapterAt(Math.max(0, state.currentIdx)); }
+
+function openDrawer() {
+  if (!segs().length) { toast('Vänta tills det finns lite text.'); return; }
+  ensureDerived();
+  $('aiDrawer').classList.add('open');
+  $('aiDrawer').setAttribute('aria-hidden', 'false');
+  $('drawerShade').classList.remove('hidden');
+  document.body.classList.add('drawer-open');
+  showAIView(hasKey() ? 'main' : 'setup');
+}
+function closeDrawer() {
+  $('aiDrawer').classList.remove('open');
+  $('aiDrawer').setAttribute('aria-hidden', 'true');
+  $('drawerShade').classList.add('hidden');
+  document.body.classList.remove('drawer-open');
+}
+function drawerOpen() { return $('aiDrawer').classList.contains('open'); }
+
+function showAIView(view) {
+  const setup = view === 'setup';
+  $('aiSetup').classList.toggle('hidden', !setup);
+  $('aiMain').classList.toggle('hidden', setup);
+  $('aiAsk').classList.toggle('hidden', setup);
+  if (setup) {
+    $('aiKeyInput').value = '';
+    $('aiKeyInput').placeholder = hasKey() ? 'Nyckel sparad ✓ – klistra in en ny för att byta' : 'sk-ant-…';
+    $('aiKeyActions').classList.toggle('hidden', !hasKey());
+    $('aiKeyStatus').textContent = '';
+    renderCopyGrid();
+  } else {
+    renderAITools();
+    renderThread();
+    setTimeout(() => $('aiQuestion').focus(), 50);
+  }
+}
+
+function renderCopyGrid() {
+  const grid = $('aiCopyGrid');
   grid.innerHTML = '';
-  for (const key of Object.keys(PROMPTS)) {
+  for (const key of ['summary', 'flashcards', 'quiz', 'concepts', 'plan']) {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'ai-card';
-    b.innerHTML = `<b>${PROMPTS[key].label}</b><small>${descr[key]}</small>`;
-    b.onclick = () => {
-      const list = aiScopeSegments();
-      const scope = document.querySelector('input[name=scope]:checked')?.value;
-      const c = scope === 'chapter' ? chapterAt(Math.max(0, state.currentIdx)) : null;
-      openAI(key, list, scope === 'star' ? 'stjärnmärkta delar' : c ? `avsnitt: ${c.title}` : '');
-      $('aiDialog').close();
-    };
+    b.innerHTML = `<b>${PROMPTS[key].label}</b>`;
+    b.onclick = () => copyToClaude(key, segs(), '');
     grid.appendChild(b);
   }
-  const c = chapterAt(Math.max(0, state.currentIdx));
-  $('scopeChapterName').textContent = c ? `(${c.title})` : '';
-  const words = segs().reduce((n, x) => n + x.t.split(/\s+/).length, 0);
-  $('aiInfo').textContent = `Hela texten är ca ${words.toLocaleString('sv-SE')} ord. Mycket långa föreläsningar kan behöva ett betalt Claude-konto – välj då ett avsnitt eller det stjärnmärkta.`;
-  $('aiDialog').showModal();
+}
+
+function renderAITools() {
+  const c = currentChapter();
+  $('scopeChapterBtn').title = c ? c.title : '';
+  document.querySelectorAll('[data-scope]').forEach(b => b.classList.toggle('active', b.dataset.scope === aiState.scope));
+  const box = $('aiTools');
+  box.innerHTML = '';
+  for (const t of AI_TOOLS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ai-card';
+    b.disabled = aiState.busy;
+    b.innerHTML = `<b>${t.label}</b><small>${t.descr}</small>`;
+    b.onclick = () => runTool(t.key);
+    box.appendChild(b);
+  }
+}
+
+const itemTime = (ms) => new Date(ms).toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+function costLabel(kr) { return kr ? ` · ≈ ${kr < 0.1 ? '<0,1' : kr.toFixed(1).replace('.', ',')} kr` : ''; }
+
+async function itemHTML(it) {
+  if (it.role === 'user') {
+    return `<div class="ai-msg user" data-id="${it.id}"><div class="bubble">${escapeHtml(it.display || it.prompt)}</div></div>`;
+  }
+  const body = it.text ? await renderMarkdown(it.text) : '<p class="muted">…</p>';
+  return `<div class="ai-msg bot" data-id="${it.id}">
+    <div class="ai-meta"><b>${escapeHtml(it.label || 'Svar')}</b><span class="muted tiny">${it.focus ? escapeHtml(it.focus) + ' · ' : ''}${itemTime(it.at)}${costLabel(it.cost)}</span>
+      <span class="spacer"></span>
+      <button class="icon-btn small" data-ai="copy" title="Kopiera">📋</button>
+      <button class="icon-btn small" data-ai="doc" title="Spara som Word">⬇</button>
+      <button class="icon-btn small" data-ai="del" title="Ta bort">🗑</button></div>
+    <div class="md">${body}</div>
+    ${it.cards ? `<button class="btn small accent" data-ai="quiz">🧠 Öva på korten nu</button>` : ''}
+    ${it.truncated ? '<p class="muted tiny">Svaret blev avkortat – be om "fortsätt" i rutan nedan.</p>' : ''}
+  </div>`;
+}
+
+async function renderThread() {
+  const items = lecAI().items;
+  const box = $('aiThread');
+  if (!items.length) {
+    box.innerHTML = `<div class="ai-empty">
+      <p><b>Välj ett verktyg ovan</b> eller ställ en fråga nedan, till exempel:</p>
+      <ul>
+        <li><a href="#" data-q="Vad är det viktigaste jag måste kunna från den här föreläsningen?">Vad är det viktigaste jag måste kunna?</a></li>
+        <li><a href="#" data-q="Vad kommer troligen på tentan, utifrån vad föreläsaren betonar?">Vad kommer troligen på tentan?</a></li>
+        <li><a href="#" data-q="Förklara det svåraste resonemanget i föreläsningen steg för steg, enkelt.">Förklara det svåraste steg för steg</a></li>
+      </ul></div>`;
+    return;
+  }
+  const html = await Promise.all(items.map(itemHTML));
+  box.innerHTML = html.join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+async function updateStreamingItem(it) {
+  const el = $('aiThread').querySelector(`[data-id="${it.id}"] .md`);
+  if (el) el.innerHTML = await renderMarkdown(it.text || '…');
+  const box = $('aiThread');
+  if (box.scrollHeight - box.scrollTop - box.clientHeight < 160) box.scrollTop = box.scrollHeight;
+}
+
+function setBusy(b) {
+  aiState.busy = b;
+  $('aiSend').classList.toggle('hidden', b);
+  $('aiStop').classList.toggle('hidden', !b);
+  $('aiQuestion').disabled = b;
+  document.querySelectorAll('#aiTools button').forEach(x => { x.disabled = b; });
+}
+
+// Bygger konversationen till API:t av tidigare frågor och svar (senaste 12 inläggen).
+function historyMessages() {
+  const msgs = [];
+  for (const it of lecAI().items.slice(-12)) {
+    if (it.role === 'user') msgs.push({ role: 'user', content: it.prompt });
+    else if (it.text) msgs.push({ role: 'assistant', content: it.text });
+  }
+  while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+  return msgs;
+}
+
+async function ask(prompt, { display, label = 'Svar', focus = '', effort = 'medium' } = {}) {
+  if (aiState.busy) return;
+  const items = lecAI().items;
+  const history = historyMessages();
+  const q = { id: newId(), role: 'user', prompt, display: display || prompt, at: Date.now() };
+  const a = { id: newId(), role: 'assistant', label, focus, text: '', at: Date.now() };
+  items.push(q, a);
+  await renderThread();
+  setBusy(true);
+  aiState.controller = new AbortController();
+  let pending = null;
+  try {
+    const res = await streamAnswer({
+      transcript: aiTranscript(),
+      messages: [...history, { role: 'user', content: prompt }],
+      effort,
+      signal: aiState.controller.signal,
+      onText: (t) => {
+        a.text = t;
+        if (!pending) pending = setTimeout(() => { pending = null; updateStreamingItem(a); }, 120);
+      },
+    });
+    clearTimeout(pending);
+    a.text = res.text;
+    a.truncated = res.truncated;
+    a.cost = estimateCostSEK(res.usage);
+  } catch (e) {
+    clearTimeout(pending);
+    if (!a.text) { items.splice(items.indexOf(q), 2); }
+    toast(e.message, 7000);
+    if (/API-nyckeln/.test(e.message)) showAIView('setup');
+  } finally {
+    setBusy(false);
+    aiState.controller = null;
+    saveSoon();
+    if (!$('aiMain').classList.contains('hidden')) renderThread();
+  }
+}
+
+async function runTool(key) {
+  if (aiState.busy) return;
+  const f = focusFor(aiState.scope, currentChapter());
+  if (!f) { toast('Du har inte stjärnmärkt något än. Klicka ⭐ vid viktiga meningar.'); return; }
+  const tool = AI_TOOLS.find(t => t.key === key);
+  if (key === 'cards') return makeAICards(f);
+  const task = PROMPTS[key].text.split('\n\n').slice(1).join('\n\n');
+  await ask((f.text ? f.text + '\n\n' : '') + task, { display: `${tool.label}${aiState.scope !== 'all' ? ' – ' + f.label.toLowerCase() : ''}`, label: tool.label, focus: f.label, effort: 'high' });
+}
+
+async function explainChapter(c) {
+  if (!hasKey()) { copyToClaude('explain', segs().slice(c.from, c.to), `avsnitt: ${c.title}`); return; }
+  openDrawer();
+  const f = focusFor('chapter', c);
+  const task = PROMPTS.explain.text.split('\n\n').slice(1).join('\n\n').replace('i det här utdraget', 'i det här avsnittet');
+  await ask(f.text + '\n\n' + task, { display: `Förklara avsnittet "${c.title}"`, label: 'Förklaring', focus: f.label, effort: 'high' });
+}
+
+async function askAboutSegment(i) {
+  const seg = segs()[i];
+  const wh = withHours();
+  if (!hasKey()) {
+    const from = Math.max(0, i - 6), to = Math.min(segs().length, i + 7);
+    copyToClaude('explain', segs().slice(from, to), `runt ${fmtTime(seg.s, wh)}`);
+    return;
+  }
+  openDrawer();
+  await ask(`Förklara vad föreläsaren menar här, i sitt sammanhang: [${fmtTime(seg.s, wh)}] "${seg.t}"`, { label: 'Förklaring', focus: `Vid ${fmtTime(seg.s, wh)}` });
+}
+
+async function makeAICards(f) {
+  const items = lecAI().items;
+  const q = { id: newId(), role: 'user', prompt: 'Skapa förhörskort' + (f.text ? ' – ' + f.label : ''), display: 'Förhörskort' + (aiState.scope !== 'all' ? ' – ' + f.label.toLowerCase() : ''), at: Date.now() };
+  const a = { id: newId(), role: 'assistant', label: 'Förhörskort', focus: f.label, text: '_Claude skapar förhörskort… (tar ofta 1–2 minuter)_', at: Date.now() };
+  items.push(q, a);
+  await renderThread();
+  setBusy(true);
+  aiState.controller = new AbortController();
+  try {
+    const res = await generateCards({ transcript: aiTranscript(), focus: f.text ? f.label.toLowerCase() + (aiState.scope === 'star' ? ':\n' + f.text : ` (${f.text})`) : '', signal: aiState.controller.signal });
+    const lec = state.lecture;
+    lec.aiCards = lec.aiCards || [];
+    const wh = withHours();
+    const added = res.cards.filter(c => c.q && c.a).map(c => {
+      const sec = parseTimestamp(String(c.t || '').replace(/[\[\]]/g, ''));
+      return { id: 'ai-' + newId(), q: c.q, a: c.a, s: sec ?? 0 };
+    });
+    lec.aiCards.push(...added);
+    a.text = `Skapade **${added.length} förhörskort**. De finns nu i 🧠 Förhör tillsammans med de automatiska lucktesten.\n\n` +
+      added.slice(0, 5).map(c => `- **${c.q}**${c.s ? ` [${fmtTime(c.s, wh)}]` : ''}`).join('\n') + (added.length > 5 ? `\n- … och ${added.length - 5} till` : '');
+    a.cards = added.length;
+    a.cost = estimateCostSEK(res.usage);
+  } catch (e) {
+    items.splice(items.indexOf(q), 2);
+    toast(e.message, 7000);
+    if (/API-nyckeln/.test(e.message)) showAIView('setup');
+  } finally {
+    setBusy(false);
+    aiState.controller = null;
+    saveSoon();
+    renderThread();
+  }
 }
 
 // ---------------------------------------------------------------- förhör
+// Utspridd repetition: varje kort får en ny tid för repetition efter hur det gick.
+const DAY = 86400000;
+const INTERVAL_DAYS = [0, 1, 3, 7, 16, 35, 90];
+const NEW_PER_SESSION = 15;
+const SESSION_MAX = 25;
+
+function cardsForLecture(lec) {
+  const segsL = lec.segments || [];
+  const ai = (lec.aiCards || []).map(c => ({ id: c.id, kind: 'ai', q: c.q, a: c.a, s: c.s }));
+  const cloze = segsL.length ? makeCards(segsL, keywords(segsL, 24)).map(c => ({ id: c.id, kind: 'cloze', q: c.question, a: c.answer, s: c.s, starred: c.starred })) : [];
+  return [...ai, ...cloze];
+}
+function dueInfo(lec, now = Date.now()) {
+  const prog = lec.cards || {};
+  const all = cardsForLecture(lec);
+  const due = [], fresh = [];
+  for (const c of all) {
+    const p = prog[c.id];
+    if (!p || !p.seen) fresh.push(c);
+    else if ((p.due || 0) <= now) due.push(c);
+  }
+  due.sort((x, y) => (prog[x.id].due || 0) - (prog[y.id].due || 0));
+  return { all, due, fresh, mastered: all.filter(c => (prog[c.id]?.box || 0) >= 3).length };
+}
+
 let quiz = null;
 function openQuiz() {
-  ensureDerived();
   const lec = state.lecture;
-  const all = makeCards(segs(), state.keywords);
-  lec.cards = lec.cards || {};
-  // svårast först: låg låda, sedan senast sedda sist
-  const order = all.map(c => ({ c, p: lec.cards[c.id] || { box: 0, seen: 0 } }))
-    .sort((a, b) => a.p.box - b.p.box || a.p.seen - b.p.seen || a.c.s - b.c.s)
-    .map(x => x.c);
-  quiz = { cards: order.slice(0, 20), pos: 0, right: 0, wrong: 0, total: all.length };
-  renderQuiz();
-  $('quizDialog').showModal();
+  if (!lec) return;
+  const info = dueInfo(lec);
+  const queue = [...info.due, ...info.fresh.slice(0, NEW_PER_SESSION)].slice(0, SESSION_MAX).map(card => ({ lec, card }));
+  startQuiz(queue, info.all.length, lec.title || lec.name);
 }
+async function openGlobalReview() {
+  const lecs = await db.all().catch(() => []);
+  const queue = [];
+  let total = 0;
+  for (const lec of lecs) {
+    const info = dueInfo(lec);
+    total += info.all.length;
+    queue.push(...info.due.map(card => ({ lec, card })));
+  }
+  // därefter nya kort, några per föreläsning
+  for (const lec of lecs) queue.push(...dueInfo(lec).fresh.slice(0, 5).map(card => ({ lec, card })));
+  startQuiz(queue.slice(0, 40), total, 'Alla föreläsningar');
+}
+function startQuiz(queue, total, title) {
+  quiz = { queue, pos: 0, right: 0, wrong: 0, total, title, retried: new Set(), dirty: new Set() };
+  renderQuiz();
+  if (!$('quizDialog').open) $('quizDialog').showModal();
+}
+function saveLecture(lec) {
+  if (lec === state.lecture) saveSoon();
+  else { lec.updatedAt = Date.now(); db.put(lec).catch(e => console.error(e)); }
+}
+function nextReviewLabel(box) {
+  const d = INTERVAL_DAYS[Math.min(box, INTERVAL_DAYS.length - 1)];
+  return d === 1 ? 'i morgon' : d < 7 ? `om ${d} dagar` : d < 30 ? `om ${Math.round(d / 7)} veckor` : `om ${Math.round(d / 30)} månader`;
+}
+
 function renderQuiz() {
   const body = $('quizBody');
-  const lec = state.lecture;
-  if (!quiz.cards.length) {
-    body.innerHTML = `<p>Förhöret bygger på meningar som du har <b>stjärnmärkt ⭐</b> och meningar där föreläsaren säger att något är <b>viktigt</b>. Hittade inga sådana än.</p>
-    <p class="muted">Stjärnmärk de viktigaste meningarna i texten och försök igen – eller använd <b>✨ Plugga med AI → Flashcards</b>.</p>`;
+  if (!quiz.queue.length) {
+    body.innerHTML = `<div class="quiz-card"><div class="quiz-q">Inget att repetera just nu 🎉</div>
+      <p>Förhörskort skapas på två sätt:</p>
+      <ul><li><b>✨ Plugga med AI → Förhörskort</b> – Claude skriver riktiga fråga/svar-kort av hela föreläsningen (bäst).</li>
+      <li>Automatiska lucktest av meningar du <b>stjärnmärkt ⭐</b> och där föreläsaren säger att något är <b>viktigt</b>.</li></ul>
+      <p class="muted">Kort du redan kan dyker upp igen när det är dags att repetera dem.</p></div>`;
     return;
   }
-  if (quiz.pos >= quiz.cards.length) {
-    const mastered = Object.values(lec.cards || {}).filter(p => p.box >= 3).length;
+  if (quiz.pos >= quiz.queue.length) {
+    const lec = state.lecture;
+    const left = lec ? dueInfo(lec).fresh.length : 0;
     body.innerHTML = `<div class="quiz-card"><div class="quiz-q">Bra jobbat! 🎉</div>
-      <p>Du kunde <b>${quiz.right}</b> av ${quiz.cards.length}. ${quiz.wrong ? 'De du inte kunde kommer först nästa gång.' : ''}</p>
-      <p class="muted">${mastered} av ${quiz.total} kort sitter riktigt bra (rätt 3 gånger i rad).</p></div>
-      <div class="quiz-actions"><span></span><span><button class="btn" id="qAgain">Kör igen</button> <button class="btn primary" id="qDone">Klar</button></span></div>`;
-    $('qAgain').onclick = openQuiz;
+      <p>Du kunde <b>${quiz.right}</b> av ${quiz.right + quiz.wrong} kort. ${quiz.wrong ? 'Korten du inte kunde kommer tillbaka snart.' : ''}</p>
+      <p class="muted">Korten är schemalagda för repetition – kom tillbaka i morgon, då är minnet som mest mottagligt.${left ? ` ${left} nya kort finns kvar att lära.` : ''}</p></div>
+      <div class="quiz-actions"><span></span><span>${left ? '<button class="btn" id="qAgain">Fler kort</button> ' : ''}<button class="btn primary" id="qDone">Klar</button></span></div>`;
+    if ($('qAgain')) $('qAgain').onclick = openQuiz;
     $('qDone').onclick = () => $('quizDialog').close();
     return;
   }
-  const card = quiz.cards[quiz.pos];
-  const p = lec.cards[card.id] || { box: 0 };
+  const { lec, card } = quiz.queue[quiz.pos];
+  const p = (lec.cards || {})[card.id] || { box: 0 };
+  const wh = (lec.duration || 0) >= 3600;
+  const canListen = lec === state.lecture && state.file;
+  const isAI = card.kind === 'ai';
   body.innerHTML = `
-    <div class="quiz-actions"><span class="quiz-progress">Kort ${quiz.pos + 1} av ${quiz.cards.length}${card.starred ? ' · ⭐' : ''} · ${'●'.repeat(Math.min(p.box, 3))}${'○'.repeat(3 - Math.min(p.box, 3))}</span>
+    <div class="quiz-actions"><span class="quiz-progress">Kort ${quiz.pos + 1} av ${quiz.queue.length}${quiz.title && lec !== state.lecture ? ' · ' + escapeHtml(lec.title || lec.name) : ''} · ${isAI ? 'fråga' : 'lucktest'} · ${p.seen ? 'repetition' : 'nytt'}</span>
       <span class="quiz-stats"><span>✓ ${quiz.right}</span><span>✗ ${quiz.wrong}</span></span></div>
     <div class="quiz-card">
-      <div class="quiz-q">${escapeHtml(card.question).replace('_____', '<b>_____</b>')}</div>
-      <input class="quiz-input" id="qInput" placeholder="Skriv ordet som fattas (valfritt) och tryck Enter" autocomplete="off">
+      <div class="quiz-q">${isAI ? escapeHtml(card.q) : escapeHtml(card.q).replace('_____', '<b>_____</b>')}</div>
+      ${isAI
+        ? '<textarea class="quiz-input" id="qInput" rows="3" placeholder="Svara med egna ord – att formulera svaret själv är det som får det att fastna. (Ctrl+Enter)"></textarea>'
+        : '<input class="quiz-input" id="qInput" placeholder="Skriv ordet som fattas och tryck Enter" autocomplete="off">'}
       <div class="quiz-a hidden" id="qA">
-        <div class="answer">${escapeHtml(card.answer)}</div>
-        <div id="qJudge" class="muted"></div>
-        <button class="btn small ghost" id="qListen">▶ Lyssna på stället (${fmtTime(card.s, withHours())})</button>
+        <div class="${isAI ? 'answer-text' : 'answer'}">${escapeHtml(card.a)}</div>
+        <div id="qJudge" class="judge"></div>
+        ${canListen ? `<button class="btn small ghost" id="qListen">▶ Lyssna på stället (${fmtTime(card.s, wh)})</button>` : `<span class="muted tiny">Tas upp vid ${fmtTime(card.s, wh)}</span>`}
       </div>
     </div>
     <div class="quiz-actions" id="qBtns">
       <button class="btn" id="qSkip">Hoppa över</button>
-      <button class="btn primary" id="qShow">Visa svar</button>
+      <span>${isAI && hasKey() ? '<button class="btn accent" id="qGrade">✨ Rätta mitt svar</button> ' : ''}<button class="btn primary" id="qShow">Visa svar</button></span>
     </div>`;
   const input = $('qInput');
   setTimeout(() => input.focus(), 50);
   const show = () => {
     $('qA').classList.remove('hidden');
     const guess = input.value.trim().toLowerCase();
-    if (guess) {
-      const ok = guess === card.answer.toLowerCase() || (guess.length >= 4 && card.answer.toLowerCase().startsWith(guess.slice(0, Math.max(4, guess.length - 2))));
-      $('qJudge').textContent = ok ? '✓ Rätt!' : `Du skrev: ${input.value.trim()}`;
+    if (!isAI && guess) {
+      const ans = card.a.toLowerCase();
+      const ok = guess === ans || (guess.length >= 4 && ans.startsWith(guess.slice(0, Math.max(4, guess.length - 2))));
+      $('qJudge').innerHTML = ok ? '<span class="ok">✓ Rätt!</span>' : `<span class="muted">Du skrev: ${escapeHtml(input.value.trim())}</span>`;
     }
-    $('qBtns').innerHTML = `<button class="btn" id="qWrong">✗ Kunde inte</button><button class="btn primary" id="qRight">✓ Kunde</button>`;
-    $('qWrong').onclick = () => grade(false);
-    $('qRight').onclick = () => grade(true);
+    const box = p.box || 0;
+    $('qBtns').innerHTML = `<button class="btn" id="qWrong" title="Kortet kommer tillbaka strax">✗ Kunde inte</button>
+      <button class="btn" id="qHard" title="Repeteras ${nextReviewLabel(Math.max(1, box))}">😐 Svårt</button>
+      <button class="btn primary" id="qRight" title="Repeteras ${nextReviewLabel(box + 1)}">✓ Kunde</button>`;
+    $('qWrong').onclick = () => grade(0);
+    $('qHard').onclick = () => grade(1);
+    $('qRight').onclick = () => grade(2);
     $('qRight').focus();
   };
-  input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); if ($('qA').classList.contains('hidden')) show(); } };
+  input.onkeydown = (e) => {
+    const submit = isAI ? (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) : e.key === 'Enter';
+    if (submit) { e.preventDefault(); if ($('qA').classList.contains('hidden')) ($('qGrade') && input.value.trim() ? $('qGrade').click() : show()); }
+  };
   $('qShow').onclick = show;
   $('qSkip').onclick = () => { quiz.pos++; renderQuiz(); };
-  $('qListen').onclick = () => { $('quizDialog').close(); seekTo(card.s); scrollToSegment(findIdx(card.s), true); };
-  function grade(ok) {
+  if ($('qListen')) $('qListen').onclick = () => { $('quizDialog').close(); seekTo(card.s); scrollToSegment(findIdx(card.s), true); };
+  if ($('qGrade')) $('qGrade').onclick = async () => {
+    const ans = input.value.trim();
+    if (!ans) { toast('Skriv ditt svar först.'); input.focus(); return; }
+    $('qGrade').disabled = true;
+    $('qGrade').textContent = 'Rättar…';
+    try {
+      const r = await gradeAnswer({ question: card.q, answer: card.a, studentAnswer: ans });
+      show();
+      const icon = r.verdict === 'rätt' ? '✓' : r.verdict === 'delvis' ? '◐' : '✗';
+      const cls = r.verdict === 'rätt' ? 'ok' : r.verdict === 'delvis' ? 'partial' : 'warn';
+      $('qJudge').innerHTML = `<div class="grade ${cls}"><b>${icon} ${r.verdict === 'rätt' ? 'Rätt' : r.verdict === 'delvis' ? 'Delvis rätt' : 'Inte riktigt'}</b> – ${escapeHtml(r.feedback)}</div>`;
+      const target = r.verdict === 'rätt' ? 'qRight' : r.verdict === 'delvis' ? 'qHard' : 'qWrong';
+      $(target)?.classList.add('suggested');
+      $(target)?.focus();
+    } catch (e) {
+      toast(e.message, 6000);
+      if ($('qGrade')) { $('qGrade').disabled = false; $('qGrade').textContent = '✨ Rätta mitt svar'; }
+    }
+  };
+  function grade(level) {
+    lec.cards = lec.cards || {};
     const prev = lec.cards[card.id] || { box: 0, seen: 0 };
-    lec.cards[card.id] = { box: ok ? prev.box + 1 : 0, seen: Date.now() };
-    ok ? quiz.right++ : quiz.wrong++;
+    const now = Date.now();
+    let box;
+    if (level === 0) box = 0;
+    else if (level === 1) box = Math.max(1, prev.box);
+    else box = prev.box + 1;
+    const days = level === 0 ? 0 : INTERVAL_DAYS[Math.min(box, INTERVAL_DAYS.length - 1)] * (level === 1 ? 0.6 : 1);
+    lec.cards[card.id] = { box, seen: now, due: level === 0 ? now + 10 * 60000 : now + days * DAY };
+    if (level === 0) {
+      quiz.wrong++;
+      // kom tillbaka senare i samma pass (en gång)
+      if (!quiz.retried.has(card.id)) { quiz.retried.add(card.id); quiz.queue.push({ lec, card }); }
+    } else quiz.right++;
     quiz.pos++;
-    saveSoon();
+    saveLecture(lec);
     renderQuiz();
   }
 }
@@ -853,8 +1196,9 @@ function startEdit(i) {
       const v = txt.textContent.replace(/\s+/g, ' ').trim();
       if (v && v !== seg.t) { seg.t = v; seg.edited = true; state.derivedDirty = true; saveSoon(); }
     }
-    el.outerHTML = segHTML(seg, i);
+    if (el.isConnected) el.outerHTML = segHTML(seg, i);
     updateCounts();
+    flushPendingRender();
   };
   const onBlur = () => finish(true);
   const onKey = (e) => {
@@ -875,16 +1219,25 @@ function editNote(i) {
   const ta = note.querySelector('textarea');
   ta.value = seg.note || '';
   ta.focus();
+  state.editing = i;
   const done = () => {
     seg.note = ta.value.trim();
+    state.editing = null;
     saveSoon();
-    el.outerHTML = segHTML(seg, i);
+    if (el.isConnected) el.outerHTML = segHTML(seg, i);
+    flushPendingRender();
   };
   ta.addEventListener('blur', done, { once: true });
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); ta.blur(); }
     if (e.key === 'Escape') { e.preventDefault(); ta.value = seg.note || ''; ta.blur(); }
   });
+}
+
+function flushPendingRender() {
+  if (!state.pendingRender) return;
+  state.pendingRender = false;
+  renderAll();
 }
 
 function toggleStar(i) {
@@ -898,6 +1251,84 @@ function toggleStar(i) {
     el.querySelector('.star-btn')?.classList.toggle('on', seg.star);
   }
   updateCounts();
+}
+
+// ---------------------------------------------------------------- händelser: assistent
+function bindAI() {
+  $('aiClose').onclick = closeDrawer;
+  $('drawerShade').onclick = () => { if (!aiState.busy) closeDrawer(); };
+  $('aiSettingsBtn').onclick = () => showAIView($('aiSetup').classList.contains('hidden') ? 'setup' : (hasKey() ? 'main' : 'setup'));
+  $('aiSetupDone').onclick = () => showAIView('main');
+  $('aiKeyRemove').onclick = () => { setKey(''); toast('Nyckeln är borttagen från den här webbläsaren.'); showAIView('setup'); };
+  $('aiKeyForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const k = $('aiKeyInput').value.trim();
+    if (!k) return;
+    if (!/^sk-ant-/.test(k)) { $('aiKeyStatus').innerHTML = '<span class="warn">Det ser inte ut som en Anthropic-nyckel (de börjar med sk-ant-).</span>'; return; }
+    const prev = (await import('./ai.js')).getKey();
+    setKey(k);
+    $('aiKeyStatus').textContent = 'Kontrollerar nyckeln…';
+    try {
+      await testKey();
+      $('aiKeyStatus').innerHTML = '<span class="ok">✓ Nyckeln fungerar!</span>';
+      $('aiKeyInput').value = '';
+      setTimeout(() => showAIView('main'), 700);
+    } catch (err) {
+      setKey(prev);
+      $('aiKeyStatus').innerHTML = `<span class="warn">${escapeHtml(err.message)}</span>`;
+    }
+  };
+  document.querySelectorAll('[data-scope]').forEach(b => b.onclick = () => {
+    aiState.scope = b.dataset.scope;
+    aiState.chapter = null;
+    renderAITools();
+    if (aiState.scope === 'chapter') { const c = currentChapter(); if (c) toast(`Fokus: ${c.title}`, 1800); }
+  });
+  $('aiAsk').onsubmit = (e) => {
+    e.preventDefault();
+    const q = $('aiQuestion').value.trim();
+    if (!q || aiState.busy) return;
+    $('aiQuestion').value = '';
+    $('aiQuestion').style.height = '';
+    const f = focusFor(aiState.scope, currentChapter());
+    const prefix = f && f.text && aiState.scope !== 'all' ? f.text + '\n\n' : '';
+    ask(prefix + q, { display: q, label: 'Svar', focus: aiState.scope !== 'all' && f ? f.label : '' });
+  };
+  $('aiQuestion').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('aiAsk').requestSubmit(); }
+  });
+  $('aiQuestion').addEventListener('input', (e) => {
+    e.target.style.height = 'auto';
+    e.target.style.height = Math.min(160, e.target.scrollHeight) + 'px';
+  });
+  $('aiStop').onclick = () => aiState.controller?.abort();
+  $('aiThread').addEventListener('click', async (e) => {
+    const t = e.target.closest('a[href^="#t="]');
+    if (t) { e.preventDefault(); const sec = Number(t.getAttribute('href').slice(3)); seekTo(sec); scrollToSegment(findIdx(sec), true); return; }
+    const q = e.target.closest('[data-q]');
+    if (q) { e.preventDefault(); $('aiQuestion').value = q.dataset.q; $('aiAsk').requestSubmit(); return; }
+    const btn = e.target.closest('[data-ai]');
+    if (!btn) return;
+    const id = btn.closest('[data-id]')?.dataset.id;
+    const items = lecAI().items;
+    const k = items.findIndex(x => x.id === id);
+    if (k < 0) return;
+    const it = items[k];
+    const act = btn.dataset.ai;
+    if (act === 'copy') copyText(it.text).then(ok => ok && toast('Kopierat.'));
+    else if (act === 'quiz') { closeDrawer(); openQuiz(); }
+    else if (act === 'doc') {
+      const html = await renderMarkdown(it.text);
+      const title = `${state.lecture.title} – ${it.label}`;
+      download(safeName(title) + '.doc', '\ufeff<html><head><meta charset="utf-8"><title>' + escapeHtml(title) + '</title><style>body{font-family:Calibri,Arial,sans-serif;font-size:11pt;line-height:1.5}</style></head><body><h1>' + escapeHtml(title) + '</h1>' + html + '</body></html>', 'application/msword');
+    } else if (act === 'del') {
+      // ta bort svaret och frågan som hörde till
+      const start = k > 0 && items[k - 1].role === 'user' ? k - 1 : k;
+      items.splice(start, k - start + 1);
+      saveSoon();
+      renderThread();
+    }
+  });
 }
 
 // ---------------------------------------------------------------- händelser
@@ -917,7 +1348,7 @@ function bind() {
     e.preventDefault();
     const f = e.dataTransfer?.files?.[0];
     if (!f || e.target.closest?.('#drop')) return;
-    if (!$('workView').classList.contains('hidden') && state.lecture && fileKey(f) === state.lecture.id) {
+    if (!$('workView').classList.contains('hidden') && sameFile(f, state.lecture)) {
       attachFile(f); updateResumeCard(); if (!state.lecture.done) startTranscription();
     } else handleFile(f);
   });
@@ -929,8 +1360,8 @@ function bind() {
   $('resumeInput').onchange = (e) => {
     const f = e.target.files[0]; e.target.value = '';
     if (!f) return;
-    if (fileKey(f) !== state.lecture.id) {
-      toast('Det är inte samma fil som föreläsningen påbörjades med (namn, storlek eller datum skiljer sig).', 5000);
+    if (!sameFile(f, state.lecture)) {
+      toast('Det är inte samma fil som föreläsningen påbörjades med (namn eller storlek skiljer sig).', 5000);
       return;
     }
     attachFile(f);
@@ -979,7 +1410,7 @@ function bind() {
     if (act === 'seek-ch' || act === 'ai-ch') {
       const c = state.chapters[Number(actEl.dataset.ch)];
       if (act === 'seek-ch') seekTo(c.start);
-      else openAI('explain', segs().slice(c.from, c.to), `avsnitt: ${c.title}`);
+      else explainChapter(c);
       return;
     }
     const host = actEl.closest('[data-i]');
@@ -987,9 +1418,13 @@ function bind() {
     const i = Number(host.dataset.i);
     const seg = segs()[i];
     if (act === 'seek') {
-      if (getSelection()?.toString()) return; // markerar text – hoppa inte
-      seekTo(seg.s);
+      if (e.detail > 1) return;                 // del av en dubbelklick
+      if (getSelection()?.toString()) return;   // markerar text – hoppa inte
+      // vänta lite så att en dubbelklick (redigera) inte först startar uppspelning
+      clearTimeout(state.clickTimer);
+      state.clickTimer = setTimeout(() => seekTo(seg.s), actEl.classList.contains('txt') ? 230 : 0);
     } else if (act === 'star') toggleStar(i);
+    else if (act === 'ask') askAboutSegment(i);
     else if (act === 'edit') startEdit(i);
     else if (act === 'note') editNote(i);
     else if (act === 'copy') copyText(`[${fmtTime(seg.s, withHours())}] ${seg.t}`).then(ok => ok && toast('Kopierat.'));
@@ -997,6 +1432,7 @@ function bind() {
   box.addEventListener('dblclick', (e) => {
     const txt = e.target.closest('.seg .txt');
     if (!txt || state.editing !== null) return;
+    clearTimeout(state.clickTimer);
     startEdit(Number(txt.closest('[data-i]').dataset.i));
   });
   window.addEventListener('wheel', () => { state.lastUserScroll = Date.now(); }, { passive: true });
@@ -1040,7 +1476,8 @@ function bind() {
     if (k) exportAs(k);
   });
 
-  $('aiBtn').onclick = () => { if (!segs().length) { toast('Vänta tills det finns lite text.'); return; } openAIDialog(); };
+  $('aiBtn').onclick = () => openDrawer();
+  bindAI();
   $('quizBtn').onclick = () => { if (!segs().length) { toast('Vänta tills det finns lite text.'); return; } openQuiz(); };
   $('quizClose').onclick = () => $('quizDialog').close();
 
@@ -1048,6 +1485,7 @@ function bind() {
   document.addEventListener('keydown', (e) => {
     if ($('workView').classList.contains('hidden')) return;
     if (document.querySelector('dialog[open]')) return;
+    if (e.key === 'Escape' && drawerOpen()) { if (aiState.busy) aiState.controller?.abort(); else closeDrawer(); return; }
     const tag = (e.target.tagName || '').toLowerCase();
     const typing = tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable;
     if (typing) return;
@@ -1058,6 +1496,9 @@ function bind() {
     else if ((e.key === 's' || e.key === 'S') && state.currentIdx >= 0 && !e.ctrlKey && !e.metaKey) { toggleStar(state.currentIdx); toast(segs()[state.currentIdx].star ? '⭐ Stjärnmärkt' : 'Stjärna borttagen', 1200); }
   });
 
+  // spara direkt när fliken göms eller stängs
+  window.addEventListener('pagehide', () => { saveNow(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveNow(); });
   window.addEventListener('beforeunload', (e) => {
     if (state.running) { saveNow(); e.preventDefault(); e.returnValue = ''; }
   });

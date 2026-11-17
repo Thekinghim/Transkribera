@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Transkribera – Hämta föreläsning",
+  "short_name": "Hämta föreläsning",
+  "version": "1.0.0",
+  "description": "Hittar föreläsningsvideor som du redan kan spela upp och sparar dem på datorn, så att du kan transkribera dem i Transkribera.",
+  "minimum_chrome_version": "116",
+  "permissions": ["webRequest", "downloads", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Hämta föreläsning",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    }
+  ]
+}
