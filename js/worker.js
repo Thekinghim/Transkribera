@@ -44,7 +44,8 @@ async function load(modelKey, forceWasm = false) {
       post('status', { text: 'Laddar modellen (WebGPU)…' });
       asr = await pipeline('automatic-speech-recognition', model, {
         device: 'webgpu',
-        dtype: { encoder_model: gpu.f16 ? 'fp16' : 'fp32', decoder_model_merged: 'q4' },
+        // fp16-kodaren ger skräptext (�) på en del grafikkort – kör den alltid i fp32
+        dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
         progress_callback,
       });
       // provkör så att WebGPU-fel upptäcks direkt i stället för mitt i föreläsningen

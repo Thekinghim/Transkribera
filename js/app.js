@@ -100,6 +100,13 @@ function killWorker(reason) {
 }
 const GPU_STALL_SECONDS = 100;
 
+// Skräptext från modellen (t.ex. trasig GPU-beräkning): många ersättningstecken � eller ingen svensk text alls.
+function isGarbage(text) {
+  if (!text) return false;
+  const bad = (text.match(/\uFFFD/g) || []).length;
+  return bad >= 3 && bad / text.length > 0.02;
+}
+
 function transcribeBlock(audio) {
   const id = ++reqId;
   return new Promise((resolve, reject) => {
@@ -246,6 +253,7 @@ async function handleFile(file) {
     };
     await db.put(lec);
   }
+  if (lec.segments?.some(x => isGarbage(x.t))) lec.done = false;
   await openLecture(lec, file);
   if (!lec.done) startTranscription();
 }
@@ -358,6 +366,18 @@ async function startTranscription() {
     $('progressTitle').textContent = 'Transkriberar…';
     setStatus(workerDevice === 'webgpu' ? 'Använder grafikkortet (WebGPU).' : (lec.model === 'small' ? 'Använder processorn (WASM) – Noggrann blir mycket långsam utan grafikkort. Välj hellre Snabb för nästa föreläsning.' : 'Använder processorn (WASM) – det tar längre tid än med grafikkort.'));
 
+    // Rensa skräptext som sparats från en tidigare körning och fortsätt därifrån
+    const firstBad = lec.segments.findIndex(x => isGarbage(x.t));
+    if (firstBad >= 0) {
+      lec.cursor = firstBad === 0 ? 0 : lec.segments[firstBad - 1].e;
+      lec.segments.length = firstBad;
+      lec.done = false;
+      state.derivedDirty = true;
+      await saveNow();
+      renderAll();
+      toast('Felaktig text från en tidigare körning togs bort – transkriberar om den delen.', 6000);
+    }
+
     while (lec.cursor < lec.duration - 0.3 && !state.stopRequested) {
       const start = lec.cursor;
       // första blocket är kort så att text och hastighet syns snabbt
@@ -404,20 +424,25 @@ async function startTranscription() {
               (lec.model === 'small' ? 'Utan grafikkort är Noggrann mycket långsam – pausa och välj Snabb för snabbare resultat.' : 'Processorn arbetar – det går långsammare än med grafikkort men blir klart.'));
           }
         }, 5000);
+        let garbage = false, failed = null;
         try {
           raw = await transcribeBlock(audio.slice()); // kopia – originalet behövs om vi måste göra om
-          break;
+          garbage = workerDevice === 'webgpu' && isGarbage(raw.map(r => r.text).join(' '));
         } catch (e) {
-          if (!stalled) throw e;
-          setPreferCpu(true);
-          toast('Grafikkortet svarade inte – byter till processorn och fortsätter.', 6000);
-          setStatus('Grafikkortet svarade inte. Laddar modellen för processorn…');
-          await loadModel(lec.model || 'base', true);
-          setStatus(`Transkriberar ${fmtTime(start, wh)}–${fmtTime(end, wh)} (processor)…`);
-          lastChunkAt = performance.now();
+          failed = e;
         } finally {
           clearInterval(watchdog);
         }
+        if (failed && !stalled) throw failed;
+        if (!failed && !garbage) break;
+        // grafikkortet hängde sig eller gav skräptext: byt till processorn och gör om samma del
+        killWorker(garbage ? 'GPU_GARBAGE' : 'GPU_STALL');
+        setPreferCpu(true);
+        toast(garbage ? 'Grafikkortet gav felaktig text – byter till processorn och gör om delen.' : 'Grafikkortet svarade inte – byter till processorn och fortsätter.', 6000);
+        setStatus('Grafikkortet fungerade inte. Laddar modellen för processorn…');
+        await loadModel(lec.model || 'base', true);
+        setStatus(`Transkriberar ${fmtTime(start, wh)}–${fmtTime(end, wh)} (processor)…`);
+        lastChunkAt = performance.now();
       }
       onChunk = null;
       clearInterval(ticker);
