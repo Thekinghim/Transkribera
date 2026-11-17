@@ -65,24 +65,27 @@ function segs() { return state.lecture?.segments || []; }
 function withHours() { return (state.lecture?.duration || 0) >= 3600; }
 
 let saveTimer = null, lastSave = 0;
+let saveFailed = false;   // senaste sparningen misslyckades (t.ex. fullt lagringsutrymme)
 function saveSoon() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveNow, 600);
+  saveTimer = setTimeout(() => saveNow(), 600);
 }
 // Under transkribering: spara direkt om det var ett tag sedan, annars inom några sekunder.
 // Då går aldrig mer än det pågående fönstret plus några sekunder förlorat om fliken stängs.
 const SAVE_EVERY_MS = 4000;
-function saveThrottled() {
+function saveThrottled(lec) {
   const wait = SAVE_EVERY_MS - (Date.now() - lastSave);
-  if (wait <= 0) saveNow();
-  else { clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, wait); }
+  if (wait <= 0) saveNow(lec);
+  else { clearTimeout(saveTimer); saveTimer = setTimeout(() => saveNow(lec), wait); }
 }
-async function saveNow() {
+/** Sparar föreläsningen (den öppna, om ingen anges). Ger false om det inte gick. */
+async function saveNow(lec = state.lecture) {
   clearTimeout(saveTimer);
-  if (!state.lecture) return;
+  if (!lec) return true;
   lastSave = Date.now();
-  state.lecture.updatedAt = Date.now();
-  try { await db.put(state.lecture); } catch (e) { console.error(e); toast('Kunde inte spara: ' + e.message); }
+  lec.updatedAt = Date.now();
+  try { await db.put(lec); saveFailed = false; return true; }
+  catch (e) { console.error(e); saveFailed = true; toast('Kunde inte spara: ' + e.message); return false; }
 }
 
 // ---------------------------------------------------------------- systeminfo
@@ -90,16 +93,19 @@ async function showSysInfo() {
   const el = $('sysinfo');
   const parts = [];
   const gpu = await webgpuUsable();   // samma bedömning som motorn gör (mjukvaru-WebGPU räknas inte)
-  parts.push(gpu
-    ? '<span class="ok">✓ Grafikkortet (WebGPU) kan användas</span> – snabb transkribering.'
-    : '<span class="warn">WebGPU saknas</span> – det fungerar ändå, men långsammare (processorn används).');
+  // har grafikkortet gett fel tidigare har motorn valt bort det – säg det, och låt användaren prova igen
+  const demoted = gpu && !preferCpu() && gpuRemembered();
+  parts.push(demoted
+    ? '<span class="warn">Grafikkortet gav fel förra gången</span> – processorn används tills vidare (långsammare). <a href="#" id="gpuRetry">Prova grafikkortet igen</a>'
+    : gpu
+      ? '<span class="ok">✓ Grafikkortet (WebGPU) kan användas</span> – snabb transkribering.'
+      : '<span class="warn">WebGPU saknas</span> – det fungerar ändå, men långsammare (processorn används).');
   if (typeof AudioDecoder === 'undefined') parts.push('<span class="warn">WebCodecs saknas – använd Chrome eller Edge.</span>');
   try {
     const est = await navigator.storage?.estimate?.();
     if (est?.quota) $('storageInfo').textContent = `Sparat lokalt: ${formatBytes(est.usage || 0)}`;
   } catch {}
   parts.push(`<label class="cpu-toggle"><input type="checkbox" id="cpuToggle"${preferCpu() ? ' checked' : ''}> Använd processorn i stället för grafikkortet <span class="muted">(om transkriberingen står still)</span></label>`);
-  if (gpu && !preferCpu() && gpuRemembered()) parts.push('<span class="warn">Grafikkortet gav fel förra gången</span> – processorn används tills vidare. <a href="#" id="gpuRetry">Prova grafikkortet igen</a>');
   el.innerHTML = parts.join('<br>');
   // ändrat val = börja om från början med att prova vad som fungerar
   $('cpuToggle').onchange = (e) => { setPreferCpu(e.target.checked); forgetBackendMemory(); if (!state.running) releaseWorkers(); showSysInfo(); };
@@ -189,6 +195,7 @@ async function handleFile(file) {
     };
     await db.put(lec);
   }
+  if (state.lecture?.id === lec.id) lec = state.lecture;   // redan öppen: samma objekt, se openLecture
   if (lec.segments?.some(x => isGarbageText(x.t))) lec.done = false;
   await openLecture(lec, file);
   if (!lec.done) startTranscription();
@@ -196,6 +203,9 @@ async function handleFile(file) {
 
 async function openLecture(lec, file = null) {
   if (state.running && state.lecture?.id !== lec.id) { toast('En transkribering pågår. Pausa den först.'); return; }
+  // Biblioteket ger en ny kopia ur databasen. Är föreläsningen redan öppen gäller objektet i minnet:
+  // det är dit en pågående transkribering skriver, och det kan ha ändringar som inte hunnit sparas.
+  if (state.lecture?.id === lec.id) lec = state.lecture;
   if (state.lecture !== lec) {
     if (state.lecture?.id !== lec.id) { detachFile(); $('progressCard').classList.add('hidden'); }
     if (drawerOpen()) closeDrawer();
@@ -276,6 +286,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pagehide', () => { if (state.running) saveNow(); });
 
 const PAUSED_TEXT = 'Allt hittills är sparat. Du kan fortsätta när du vill – även efter att ha stängt fliken.';
+const SAVE_FAILED_TEXT = 'Texten kunde inte sparas i webbläsaren (är lagringsutrymmet fullt?). Exportera texten innan du stänger fliken, annars går den förlorad.';
 
 async function startTranscription() {
   const lec = state.lecture;
@@ -306,7 +317,7 @@ async function startTranscription() {
       lec.segments.length = firstBad;
       lec.done = false;
       state.derivedDirty = true;
-      await saveNow();
+      await saveNow(lec);
       renderAll();
       toast('Felaktig text från en tidigare körning togs bort – transkriberar om den delen.', 6000);
     }
@@ -319,7 +330,6 @@ async function startTranscription() {
         model: lec.model || 'base',
         startAt: lec.cursor,
         prefs: { useCpu: preferCpu() },
-        tuning: globalThis.__transkriberaTuning,   // bara för tester
         on: {
           status: ({ phase, text }) => { setTitle(phase === 'loading' ? 'Laddar modellen…' : 'Transkriberar…'); if (!state.stopRequested) setStatus(text); },
           notice: (text) => toast(text, 6000),
@@ -338,19 +348,20 @@ async function startTranscription() {
               appendSegments(seg);
             }
             lec.cursor = cursor;
-            saveThrottled();
+            saveThrottled(lec);
           },
           error: (e) => { failure = e; },
         },
       });
       outcome = await engine.start();
     }
-    await saveNow();
+    if (outcome === 'done') { lec.done = true; lec.cursor = lec.duration; }
+    // allt ska vara sparat innan sidan säger att det är det
+    const stored = await saveNow(lec);
+    if (outcome === 'error') throw failure?.cause instanceof UserFacingError ? failure.cause : Object.assign(new Error(failure?.message || 'Okänt fel'), { shown: true });
+    if (!stored) throw Object.assign(new Error(SAVE_FAILED_TEXT), { shown: true, unsaved: true });
 
     if (outcome === 'done') {
-      lec.done = true;
-      lec.cursor = lec.duration;
-      await saveNow();
       $('progressTitle').textContent = 'Klart!';
       updateProgress(1);
       setStatus(`Hela föreläsningen (${fmtDuration(lec.duration)}) är transkriberad.`);
@@ -358,21 +369,21 @@ async function startTranscription() {
       if (hasKey()) setStatus('Klart! Tips: öppna ✨ Plugga med AI och skapa en sammanfattning och förhörskort direkt.');
       notifyDone(lec);
       setTimeout(() => { if (!state.running) $('progressCard').classList.add('hidden'); }, 8000);
-    } else if (outcome === 'paused') {
+    } else {
       $('progressTitle').textContent = 'Pausad';
       setStatus(PAUSED_TEXT);
-    } else {
-      throw failure?.cause instanceof UserFacingError ? failure.cause : Object.assign(new Error(failure?.message || 'Okänt fel'), { shown: true });
     }
   } catch (e) {
-    if (state.stopRequested) {
+    if (state.stopRequested && !e.unsaved) {
       $('progressTitle').textContent = 'Pausad';
-      setStatus(PAUSED_TEXT);
+      setStatus(saveFailed ? SAVE_FAILED_TEXT : PAUSED_TEXT);
     } else {
       console.error(e);
       $('progressTitle').textContent = 'Något gick fel';
       const msg = e instanceof UserFacingError || e.shown ? e.message : `Fel: ${e.message || e}`;
-      setStatus(msg + (lec.segments.length ? ' Det som hunnit transkriberas är sparat.' : ''));
+      // lova inte att texten är sparad om sparningen inte gick
+      const saved = !e.unsaved && lec.segments.length && await saveNow(lec);
+      setStatus(msg + (saved ? ' Det som hunnit transkriberas är sparat.' : saveFailed && !e.unsaved ? ' ' + SAVE_FAILED_TEXT : ''));
       toast(msg, 6000);
     }
   } finally {

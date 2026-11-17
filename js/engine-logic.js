@@ -16,7 +16,8 @@ const FRAME = Math.round(FRAME_S * SAMPLE_RATE);
 
 // ---------------------------------------------------------------- ljudanalys
 const DB_FLOOR = -100;
-const ABS_SILENCE_DB = -60;           // under detta är det alltid tyst
+const ABS_SILENCE_DB = -60;           // under detta är det tyst – om inte hela inspelningen är svag (se nedan)
+const LOUD_RANGE_DB = 30;             // … då räknas det som ligger mer än 30 dB under fönstrets starka ljud som tyst
 const ALWAYS_ACTIVE_DB = -45;         // över detta räknas det aldrig som tyst (hellre för mycket än för lite)
 const NOISE_MARGIN_DB = 8;            // ljud måste ligga så här mycket över brusgolvet
 
@@ -32,6 +33,20 @@ export function frameDb(pcm) {
   }
   return out;
 }
+
+/** Antal nollgenomgångar per 30 ms-ruta – ett enkelt mått på ljudets klang. */
+export function frameZeroCrossings(pcm) {
+  const n = Math.floor(pcm.length / FRAME);
+  const out = new Float32Array(n);
+  for (let f = 0; f < n; f++) {
+    let c = 0;
+    for (let i = f * FRAME + 1, end = (f + 1) * FRAME; i < end; i++) if ((pcm[i] >= 0) !== (pcm[i - 1] >= 0)) c++;
+    out[f] = c;
+  }
+  return out;
+}
+const STEADY_LEVEL_DB = 3;            // jämn nivå: mindre än 3 dB mellan svaga och starka rutor
+const STEADY_ZCR_RATIO = 1.5;         // jämn klang: se analyseWindow
 
 function percentile(sorted, p) {
   if (!sorted.length) return DB_FLOOR;
@@ -49,18 +64,26 @@ export function analyseWindow(pcm, noiseFloorDb = null) {
   const sorted = Float32Array.from(db).sort();
   const p10 = percentile(sorted, 0.10), p50 = percentile(sorted, 0.5), p90 = percentile(sorted, 0.9);
   const floor = noiseFloorDb == null ? p10 : Math.min(noiseFloorDb, p10);
-  const threshold = Math.max(ABS_SILENCE_DB, Math.min(ALWAYS_ACTIVE_DB, floor + NOISE_MARGIN_DB));
+  // Tystnadsgränsen är relativ: en svag inspelning (mobil längst bak i salen) får inte räknas som
+  // tystnad bara för att den ligger under ett fast värde. Modellen normaliserar nivån själv.
+  const threshold = Math.max(Math.min(ABS_SILENCE_DB, p90 - LOUD_RANGE_DB), Math.min(ALWAYS_ACTIVE_DB, floor + NOISE_MARGIN_DB));
   const active = new Uint8Array(db.length);
   let activeFrames = 0;
   for (let i = 0; i < db.length; i++) if (db[i] > threshold) { active[i] = 1; activeFrames++; }
-  // Jämnt ljud (ton, brum, fläkt): nästan alla rutor aktiva men nivån varierar knappt. Tal varierar
-  // alltid mycket (pauser mellan ord och stavelser), så det här kan inte vara tal.
+  // Jämn ton (testton, brum): nästan alla rutor aktiva, nivån varierar knappt OCH klangen är
+  // densamma hela tiden. Nivån ensam räcker inte – hårt komprimerat tal (mobilens automatiska
+  // förstärkning, Zoom) har också jämn nivå, men där växlar klangen mellan vokaler och konsonanter.
+  // Klangen mäts som antal nollgenomgångar per ruta: ton ger kvoten 1,0 mellan stora och små
+  // värden, brus 2,3–2,7, komprimerat tal 3,8–4,9 och vanligt tal 8–12 (uppmätt).
   let steady = false;
   if (db.length >= 30 && activeFrames >= 0.9 * db.length) {
     const act = [];
     for (let i = 0; i < db.length; i++) if (active[i]) act.push(db[i]);
     act.sort((a, b) => a - b);
-    steady = percentile(act, 0.97) - percentile(act, 0.03) < 3;
+    if (percentile(act, 0.97) - percentile(act, 0.03) < STEADY_LEVEL_DB) {
+      const z = frameZeroCrossings(pcm).sort();
+      steady = (percentile(z, 0.9) + 1) / (percentile(z, 0.1) + 1) < STEADY_ZCR_RATIO;
+    }
   }
   return { db, active, activeS: activeFrames * FRAME_S, durS: pcm.length / SAMPLE_RATE, p10, p50, p90, threshold, steady };
 }
@@ -154,6 +177,7 @@ export function parseTokens(tokens, { timestampBegin, eos, precision = 0.02 }) {
 export const MIN_ADVANCE_S = 1;       // varje fönster flyttar fram minst så här långt
 const REDO_TAIL_MIN_START_S = 5;      // gör bara om sista meningen om minst 5 s ändå blir klart
 const TAIL_SPEECH_S = 1.5;            // så mycket ljud efter sista tidsstämpeln betyder att modellen slutade för tidigt
+const UNCUT_TAIL_S = 0.3;             // … och så lite räcker när fönstret slutar mitt i ljud utan paus
 
 /**
  * Whispers sekventiella långformsalgoritm: spara bara färdiga bitar och börja nästa fönster där den
@@ -205,9 +229,18 @@ export function planCommit({ pieces, winStart, useS, isLast = false, cutInSilenc
     // fönstret tog slut mitt i tal och modellen stängde sista meningen vid kanten: gör om den i nästa fönster
     return { segments: abs(clean.slice(0, -1)), next: r2(winStart + last.start), rule: 'redo-cut-sentence' };
   }
-  if (last.end < useS - 2 && last.end >= MIN_ADVANCE_S && activeAfter && activeAfter(last.end + 0.2) >= TAIL_SPEECH_S) {
+  if (last.end >= MIN_ADVANCE_S && activeAfter) {
     // modellen slutade tidigt fast det fortfarande låter: fortsätt därifrån i stället för att lita på den
-    return { segments: abs(clean), next: r2(winStart + last.end), rule: 'early-stop' };
+    if (last.end < useS - 2 && activeAfter(last.end + 0.2) >= TAIL_SPEECH_S) {
+      return { segments: abs(clean), next: r2(winStart + last.end), rule: 'early-stop' };
+    }
+    // Fönstret gick inte att klippa i en paus (brusig inspelning) och det låter efter sista
+    // tidsstämpeln: där kan en mening ha börjat som modellen inte tog med. Börja nästa fönster vid
+    // tidsstämpeln så att den inte tappas. (Uppmätt på sju brusiga filer: en tappad bisats kommer
+    // med, ordfelen i övrigt oförändrade inom modellens spridning.)
+    if (!isLast && !cutInSilence && last.end < useS - 0.3 && activeAfter(last.end + 0.1) >= UNCUT_TAIL_S) {
+      return { segments: abs(clean), next: r2(winStart + last.end), rule: 'uncut-tail' };
+    }
   }
   return { segments: abs(clean), next: winEnd, rule: 'full' };
 }

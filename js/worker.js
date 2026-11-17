@@ -3,17 +3,20 @@
 //
 // Protokoll (ett anrop åt gången, varje anrop har ett id):
 //   -> { op:'load', id, repo, device:'webgpu'|'wasm', dtype, threads, abort?:SharedArrayBuffer }
-//   <- { ev:'download', file, loaded, total }*          nedladdning av modellfiler
-//   <- { ev:'stage', id, stage:'session'|'warmup' }     vad som händer under laddningen
+//   <- { ev:'files', id, missing:[fil…] }               modellfiler som inte finns sparade i webbläsaren
+//   <- { ev:'download', file, loaded, total }*          inläsning av modellfiler (från nätet eller webbläsarens cache)
+//   <- { ev:'download', file, done:true }               en fil är färdigläst
+//   <- { ev:'stage', id, stage:'warmup' }               modellen är byggd (på grafikkortet provkörs den nu)
 //   <- { ev:'loaded', id, device, threads, ms }
 //   -> { op:'transcribe', id, audio:Float32Array (≤30 s, 16 kHz mono), maxNewTokens?, noRepeatNgram?, temperature? }
 //   <- { ev:'tick', id, tokens }*                       livstecken: kodaren klar (tokens=0), sedan var 16:e token
 //   <- { ev:'result', id, pieces:[{start,end|null,text}], endsWithTimestamp, stats:{tokens,avgLogprob,hitMax,aborted,ms,encodeMs} }
 //   -> { op:'dispose', id }      <- { ev:'disposed', id }
 //   <- { ev:'error', id, code:'NO_WEBGPU'|'LOAD'|'RUN'|'BAD_REQUEST'|'CRASH', message }
-// Avbrott mitt i ett fönster: sätt abort[0] = 1 (delat minne) så slutar avkodningen vid nästa token.
+// Avbrott mitt i ett fönster: sätt abort[0] = 1 (delat minne) så slutar avkodningen vid nästa token
+// (under kodarens körning, de första sekunderna av ett fönster, går det inte att avbryta).
 import {
-  pipeline, env, LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList, log_softmax,
+  pipeline, env, LogitsProcessor, LogitsProcessorList, log_softmax,
 } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.min.js';
 import { parseTokens, SAMPLE_RATE } from './engine-logic.js';
 
@@ -30,11 +33,16 @@ const post = (m) => self.postMessage(m);
 class CodedError extends Error { constructor(code, message) { super(message); this.code = code; } }
 const aborted = () => !!abortFlag && Atomics.load(abortFlag, 0) !== 0;
 
-/** Livstecken, modellens säkerhet (medel-logsannolikhet för texttokens) och tidsstämplar som aldrig går bakåt. */
+/**
+ * Körs före varje token. Ger livstecken, mäter modellens säkerhet (medel-logsannolikhet för
+ * texttokens), ser till att tidsstämplar aldrig går bakåt och avbryter avkodningen när sidan ber om
+ * det. (Avbrottet görs här genom att tvinga fram sluttoken: transformers.js 3.8.1 skickar inte
+ * vidare stopping_criteria för Whisper.)
+ */
 class Monitor extends LogitsProcessor {
-  constructor(id, timestampBegin) {
+  constructor(id, { timestampBegin, eos }) {
     super();
-    this.id = id; this.tsBegin = timestampBegin;
+    this.id = id; this.tsBegin = timestampBegin; this.eos = eos; this.aborted = false;
     this.promptLen = null; this.steps = 0; this.prev = null; this.sum = 0; this.count = 0; this.encodeMs = null; this.t0 = performance.now();
   }
   _call(input_ids, logits) {
@@ -43,6 +51,7 @@ class Monitor extends LogitsProcessor {
     if (this.steps % 16 === 0) post({ ev: 'tick', id: this.id, tokens: this.steps });
     this.steps++;
     const data = logits[0].data;
+    if (aborted()) { this.aborted = true; data.fill(-Infinity); data[this.eos] = 0; return logits; }
     // sannolikheten för den token som valdes i förra steget
     if (this.prev) {
       const chosen = Number(ids[ids.length - 1]);
@@ -62,28 +71,24 @@ class Monitor extends LogitsProcessor {
   }
   get avgLogprob() { return this.count ? this.sum / this.count : null; }
 }
-class AbortCriteria extends StoppingCriteria {
-  _call(input_ids) { const a = aborted(); return input_ids.map(() => a); }
-}
 
 async function run(id, audio, { maxNewTokens = 224, noRepeatNgram = 0, temperature = 0 } = {}) {
   const t0 = performance.now();
   const { input_features } = await asr.processor(audio);
-  const monitor = new Monitor(id, spec.timestampBegin);
+  const monitor = new Monitor(id, spec);
   const processors = new LogitsProcessorList(); processors.push(monitor);
-  const stops = new StoppingCriteriaList(); stops.push(new AbortCriteria());
   const options = {
     inputs: input_features,
     language: 'swedish', task: 'transcribe', return_timestamps: true,
     max_new_tokens: maxNewTokens,
-    logits_processor: processors, stopping_criteria: stops,
+    logits_processor: processors,
   };
   if (noRepeatNgram > 0) options.no_repeat_ngram_size = noRepeatNgram;
   if (temperature > 0) { options.do_sample = true; options.temperature = temperature; }
   const out = await asr.model.generate(options);
   const seq = (out.tolist ? out.tolist()[0] : out[0]).map(Number);
   const gen = seq.slice(monitor.promptLen ?? 0);
-  const wasAborted = aborted();
+  const wasAborted = monitor.aborted || aborted();
   const hitMax = !wasAborted && gen.length >= maxNewTokens && gen[gen.length - 1] !== spec.eos;
   const parsed = parseTokens(gen, spec);
   const pieces = parsed.pieces.map(p => ({
@@ -99,9 +104,24 @@ async function run(id, audio, { maxNewTokens = 224, noRepeatNgram = 0, temperatu
   };
 }
 
+// Filnamnstillägg per precision, som i transformers.js.
+const DTYPE_SUFFIX = { fp32: '', fp16: '_fp16', int8: '_int8', uint8: '_uint8', q8: '_quantized', q4: '_q4', q4f16: '_q4f16', bnb4: '_bnb4' };
+
+/** Vilka av modellfilerna saknas i webbläsarens cache (och måste laddas ner)? null om det inte går att ta reda på. */
+async function missingFiles(repo, dtype) {
+  try {
+    const names = Object.entries(dtype).map(([name, d]) => `onnx/${name}${DTYPE_SUFFIX[d] ?? ''}.onnx`);
+    const cache = await caches.open('transformers-cache');
+    const urls = (await cache.keys()).map(r => r.url);
+    return names.filter(n => !urls.some(u => u.includes(`/${repo}/`) && u.endsWith('/' + n)));
+  } catch { return null; }
+}
+
 async function load(msg) {
   const t0 = performance.now();
   if (msg.abort) abortFlag = new Int32Array(msg.abort);
+  const missing = await missingFiles(msg.repo, msg.dtype || {});
+  if (missing) post({ ev: 'files', id: msg.id, missing });
   if (msg.device === 'webgpu') {
     let adapter = null;
     try { adapter = await self.navigator?.gpu?.requestAdapter(); } catch {}
@@ -120,10 +140,11 @@ async function load(msg) {
   asr = { processor: pipe.processor, model: pipe.model, tokenizer: pipe.tokenizer, dispose: () => pipe.dispose() };
   const eos = asr.model.generation_config?.eos_token_id ?? asr.model.config?.eos_token_id;
   spec = { timestampBegin: asr.tokenizer.timestamp_begin, eos: Array.isArray(eos) ? eos[0] : eos, precision: 0.02 };
-  // Provkörning på en sekund tystnad: kompilerar grafikkortets program och avslöjar fel direkt
-  // i stället för mitt i föreläsningen.
+  // Grafikkortet provkörs på en sekund tystnad: det kompilerar dess program och avslöjar fel direkt
+  // i stället för mitt i föreläsningen. På processorn finns inget att kompilera – där vore det bara
+  // en kodarkörning (2–6 s) i onödan före första texten.
   post({ ev: 'stage', id: msg.id, stage: 'warmup' });
-  await run(msg.id, new Float32Array(SAMPLE_RATE), { maxNewTokens: 8 });
+  if (msg.device === 'webgpu') await run(msg.id, new Float32Array(SAMPLE_RATE), { maxNewTokens: 8 });
   loaded = { device: msg.device, threads: msg.device === 'wasm' ? (env.backends?.onnx?.wasm?.numThreads ?? 1) : 0 };
   post({ ev: 'loaded', id: msg.id, ...loaded, ms: Math.round(performance.now() - t0) });
 }

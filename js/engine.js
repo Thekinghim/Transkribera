@@ -33,11 +33,15 @@ const DEFAULTS = {
   loadIdleMs: { webgpu: 120_000, wasm: 240_000 },                 // inget livstecken under laddning
   runIdleMs: { webgpu: 45_000, wasm: 120_000, wasmSmall: 300_000 }, // inget livstecken under ett fönster
   maxRestartsPerWindow: 2, // omstarter av en kraschad motor för samma fönster
-  maxRestartsPerRun: 8,
+  maxRestarts: 8,          // … och totalt; var tionde fönster som går bra stryker en omstart ur räkningen
   maxNewTokens: 224,       // Whispers egen gräns per fönster (halva kontexten)
-  strikesToDemote: 2,      // så många bekräftat felaktiga fönster innan grafikkortet väljs bort
-  agreeToTrust: 3,         // så många falsklarm innan grafikkortet slutar dubbelkollas
+  strikesToDemote: 2,      // så många bekräftat felaktiga fönster innan grafikkortet väljs bort …
+  strikeStreak: 3,         // … om de är minst en femtedel av alla fönster, eller så här många i rad
+  agreeToTrust: 3,         // så många falsklarm innan grafikkortet slutar dubbelkollas (utom för lösa bokstäver)
   verify: true,            // dubbelkolla misstänkta fönster från grafikkortet på processorn
+  referenceIdleWindows: 20, // kontrollmotorn stängs efter så många fönster i rad utan anmärkning
+  parkPausedMs: 600_000,   // så länge ligger modellen kvar i minnet efter paus (för snabb fortsättning)
+  parkDoneMs: 60_000,      // … och efter en färdig körning (för nästa föreläsning)
   allowSoftwareGpu: false, // använd WebGPU även utan riktigt grafikkort (bara för tester)
 };
 
@@ -66,7 +70,7 @@ function hasWebGPU(allowSoftware = false) {
   return webgpuProbe.then(a => !!a && (allowSoftware || !a.software));
 }
 /** Kan grafikkortet användas för transkribering på den här datorn? */
-export function webgpuUsable() { return hasWebGPU(globalThis.__transkriberaTuning?.allowSoftwareGpu); }
+export function webgpuUsable() { return hasWebGPU(); }
 
 // ---------------------------------------------------------------- ljudläsare
 /** Läser framåt i källan i större bitar och håller en begränsad buffert framför läspositionen. */
@@ -119,6 +123,40 @@ class AudioReader {
   close() { this.closed = true; this.parts = []; }
 }
 
+// ---------------------------------------------------------------- vakthundens klocka
+// Vanliga timers stryps till en gång i minuten när fliken legat i bakgrunden en stund – och det är
+// just så man väntar ut en lång föreläsning. Då skulle ett hängt grafikkort aldrig upptäckas.
+// Timers i en worker stryps inte, så klockan går där. (Går den inte att starta används en vanlig timer.)
+const CLOCK_MS = 250;
+const CLOCK_GAP_MS = 3000;   // längre uppehåll än så mellan två slag = datorn sov eller sidan stod still
+const clock = {
+  subs: new Set(), worker: null, url: null, timer: null,
+  /** Anropar fn(nu) fyra gånger i sekunden tills den returnerade funktionen anropas. */
+  subscribe(fn) {
+    this.subs.add(fn);
+    if (!this.worker && !this.timer) this._start();
+    return () => { this.subs.delete(fn); if (!this.subs.size) this._stop(); };
+  },
+  _tick() { const now = performance.now(); for (const fn of [...clock.subs]) fn(now); },
+  _start() {
+    try {
+      this.url = URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${CLOCK_MS});`], { type: 'text/javascript' }));
+      this.worker = new Worker(this.url);
+      this.worker.onmessage = this._tick;
+      this.worker.onerror = (e) => { e.preventDefault?.(); this._stop(); if (this.subs.size) this.timer = setInterval(this._tick, CLOCK_MS); };
+    } catch {
+      this._stop();
+      this.timer = setInterval(this._tick, CLOCK_MS);
+    }
+  },
+  _stop() {
+    try { this.worker?.terminate(); } catch {}
+    if (this.url) URL.revokeObjectURL(this.url);
+    clearInterval(this.timer);
+    this.worker = null; this.url = null; this.timer = null;
+  },
+};
+
 // ---------------------------------------------------------------- worker
 let hostSeq = 0;
 /** En worker med (högst) en laddad modell. Ett anrop åt gången. Varje fel gör workern obrukbar. */
@@ -128,6 +166,7 @@ class WorkerHost {
     this.worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
     this.dead = false; this.loaded = null; this.pending = null; this.reqId = 0;
     this.lastBeat = performance.now(); this.onEvent = null;
+    this.phase = 'fetch';       // under laddning: 'fetch' (filer hämtas) -> 'build' (modellen byggs) -> 'warmup' (provkörs)
     this.abort = null;
     try { if (globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') this.abort = new Int32Array(new SharedArrayBuffer(4)); } catch {}
     this.worker.onmessage = (ev) => this._message(ev.data || {});
@@ -136,7 +175,7 @@ class WorkerHost {
   }
   _message(m) {
     this.lastBeat = performance.now();
-    if (m.ev === 'tick' || m.ev === 'download' || m.ev === 'stage') { this.onEvent?.(m); return; }
+    if (m.ev === 'tick' || m.ev === 'download' || m.ev === 'files' || m.ev === 'stage') { this.onEvent?.(m); return; }
     // varje fel gör workern obrukbar: den stängs och pågående anrop avvisas med felkoden
     if (m.ev === 'error') { this.kill(m.code || 'CRASH', m.message); return; }
     const p = this.pending;
@@ -157,19 +196,17 @@ class WorkerHost {
   }
   /**
    * Anrop med vakthund: kommer inget livstecken på idleMs stängs workern och anropet avvisas med
-   * TIMEOUT. Har sidan själv stått still (datorn sov, fliken strypt i bakgrunden) börjar väntan om –
-   * annars skulle ett friskt grafikkort dömas ut efter att locket fällts ner.
+   * TIMEOUT. Har datorn sovit eller sidan stått still börjar väntan om (klockan står då också
+   * still) – annars skulle ett friskt grafikkort dömas ut efter att locket fällts ner.
    */
   async guarded(msg, transfer, idleMs) {
-    const every = Math.min(1000, Math.max(50, idleMs / 4));
     let lastTick = performance.now();
-    const timer = setInterval(() => {
-      const now = performance.now();
-      if (now - lastTick > every * 3 + 2000) this.lastBeat = now;
+    const stop = clock.subscribe((now) => {
+      if (now - lastTick > CLOCK_GAP_MS) this.lastBeat = now;
       lastTick = now;
       if (now - this.lastBeat > idleMs) this.kill('TIMEOUT', 'Inget svar från modellen');
-    }, every);
-    try { return await this.request(msg, transfer); } finally { clearInterval(timer); }
+    });
+    try { return await this.request(msg, transfer); } finally { stop(); }
   }
   requestAbort() { if (this.abort) Atomics.store(this.abort, 0, 1); return !!this.abort; }
   clearAbort() { if (this.abort) Atomics.store(this.abort, 0, 0); }
@@ -184,9 +221,10 @@ class WorkerHost {
 }
 
 // En vilande, laddad worker sparas mellan körningar så att "Fortsätt" efter paus går direkt.
-let parked = null;
+// Den stängs av sig själv efter en stund – en laddad modell håller 1,5–2 GB minne.
+let parked = null, parkTimer = null;
 /** Stänger sparade workers (t.ex. när inställningen för processor/grafikkort ändras). */
-export function releaseWorkers() { parked?.kill('RELEASED'); parked = null; }
+export function releaseWorkers() { clearTimeout(parkTimer); parkTimer = null; parked?.kill('RELEASED'); parked = null; }
 
 // ---------------------------------------------------------------- motorn
 const fmt = (sec, withHours) => {
@@ -213,6 +251,7 @@ class Engine {
     this.reference = null;      // WorkerHost för nästa motor i kedjan (dubbelkoll)
     this.stats = { windows: 0, skippedS: 0, verified: 0, restarts: 0, fallbacks: [] };
     this._stop = false; this._finished = false; this._donePromise = null; this._pauseWaiters = [];
+    this._restartDebt = 0;        // omstarter efter krasch, minskar när det går bra (se maxRestarts)
     this._perBackend = new Map(); // id -> { windows, strikes, agree, trusted, crashes }
     this._hosts = new Set();      // alla workers den här körningen startat och inte stängt
   }
@@ -221,6 +260,7 @@ class Engine {
   start() {
     if (this._donePromise) return this._donePromise;
     this._donePromise = new Promise((resolve) => { this._resolveDone = resolve; });
+    this._releaseClock = clock.subscribe(() => {});   // håll vakthundens klocka igång under hela körningen
     this._main();
     return this._donePromise;
   }
@@ -269,13 +309,17 @@ class Engine {
     this._finished = true;
     clearTimeout(this._graceTimer);
     clearInterval(this._ticker);
+    this._releaseClock?.();
     this.state = state;
     this.reader?.close();
     // behåll en frisk, vilande worker till nästa körning; stäng allt annat
     const keep = this.primary?.idle && state !== 'error' ? this.primary : null;
     for (const host of this._hosts) if (host !== keep) host.kill('DONE');
     this._hosts.clear(); this.primary = null; this.reference = null;
-    if (keep) { keep.clearAbort(); keep.onEvent = null; releaseWorkers(); parked = keep; }
+    if (keep) {
+      keep.clearAbort(); keep.onEvent = null; releaseWorkers(); parked = keep;
+      parkTimer = setTimeout(releaseWorkers, state === 'paused' ? this.t.parkPausedMs : this.t.parkDoneMs);
+    }
     if (state === 'done') { this.cursor = this.duration; this._emit('done', { cursor: this.cursor, stats: this.stats }); }
     else if (state === 'paused') this._emit('paused', { cursor: this.cursor });
     else {
@@ -294,7 +338,7 @@ class Engine {
   // ---- motorval och laddning
   _stat(id) {
     let s = this._perBackend.get(id);
-    if (!s) this._perBackend.set(id, s = { windows: 0, strikes: 0, agree: 0, trusted: false, crashes: 0 });
+    if (!s) this._perBackend.set(id, s = { windows: 0, strikes: 0, streak: 0, agree: 0, trusted: false, crashes: 0, clean: 0 });
     return s;
   }
 
@@ -311,32 +355,56 @@ class Engine {
 
   _hostKey(b) { return `${this.model}|${b.id}|${b.device === 'wasm' ? this.threads : 0}|${JSON.stringify(b.dtype)}`; }
 
-  /** Laddar en motor i en ny (eller sparad) worker. Kastar EngineError vid fel. */
-  async _load(b, { quiet = false } = {}) {
+  /**
+   * Laddar en motor i en ny (eller sparad) worker. Kastar EngineError vid fel; felet bär då
+   * phase = hur långt laddningen kommit ('fetch' | 'build' | 'warmup').
+   * reference = motorn laddas mitt i körningen för att dubbelkolla ett fönster.
+   */
+  async _load(b, { reference = false } = {}) {
     this._checkStop();
     const key = this._hostKey(b);
-    if (parked && parked.key === key && parked.idle) { const h = parked; parked = null; h.clearAbort(); this._hosts.add(h); return h; }
+    if (parked && parked.key === key && parked.idle) {
+      const h = parked; parked = null; clearTimeout(parkTimer); parkTimer = null;
+      h.clearAbort(); this._hosts.add(h); return h;
+    }
     if (parked) releaseWorkers();   // en annan modell ligger laddad: frigör minnet först
     const host = new WorkerHost(key);
     this._hosts.add(host);
-    const files = new Map();
-    let downloading = false;
-    host.onEvent = (m) => {
-      if (quiet) return;
-      if (m.ev === 'download' && m.total && /\.onnx/.test(m.file || '')) {   // bara själva modellfilerna, inte småfilerna
-        files.set(m.file, { loaded: m.loaded, total: m.total });
-        let l = 0, t = 0;
-        for (const f of files.values()) { l += f.loaded; t += f.total; }
-        // filer som redan ligger i webbläsarens cache "laddas" på ett ögonblick – visa bara riktig nedladdning
-        if (l < t) downloading = true;
-        if (downloading) this._status(`Laddar ner modellen: ${Math.floor(100 * l / t)} % av ${fmtMB(t)} (bara första gången – sedan är den sparad i webbläsaren).`, 'loading');
-      } else if (m.ev === 'stage' && !note) {
-        this._status(`Startar modellen på ${b.label}…`, 'loading');
-      }
-    };
+    const what = reference ? 'kontrollmodellen' : 'modellen';
+    const say = (text) => this._status(text, reference ? this._phase : 'loading');
     // efter en krasch står det varför modellen laddas igen
-    const note = this._loadNote; this._loadNote = null;
-    if (!quiet) this._status(note ? `${note} – startar om den på ${b.label}…` : `Laddar modellen för ${b.label}…`, 'loading');
+    const note = reference ? null : this._loadNote;
+    if (!reference) this._loadNote = null;
+    say(note ? `${note} – startar om den på ${b.label}…` : `Laddar ${what} för ${b.label}…`);
+
+    const expected = Object.keys(b.dtype).length;   // antal modellfiler (kodare + avkodare)
+    const files = new Map();                        // fil -> { loaded, total, done }
+    let missing = null;                             // filer som inte finns sparade i webbläsaren (null = okänt)
+    let firstAt = 0, shownPct = 0;
+    host.onEvent = (m) => {
+      if (m.ev === 'files') { missing = new Set(m.missing || []); return; }
+      if (m.ev === 'stage') { host.phase = 'warmup'; if (!note) say(`Startar ${what} på ${b.label}…`); return; }
+      if (m.ev !== 'download' || !/\.onnx$/.test(m.file || '')) return;   // bara själva modellfilerna, inte småfilerna
+      const f = files.get(m.file) || { loaded: 0, total: 0, done: false };
+      if (m.done) { f.done = true; f.loaded = f.total; } else if (m.total) { f.loaded = m.loaded; f.total = m.total; }
+      files.set(m.file, f);
+      firstAt ||= performance.now();
+      const all = [...files.values()];
+      host.phase = files.size >= expected && all.every(x => x.done) ? 'build' : 'fetch';
+      // Sparade filer läses också in bit för bit – bara det som verkligen hämtas från nätet visas som
+      // nedladdning. Vet vi inte vad som är sparat räknas det som nedladdning först när det dragit ut.
+      const net = missing ? [...files].filter(([name]) => missing.has(name)).map(([, x]) => x)
+        : performance.now() - firstAt > 2000 ? all : [];
+      if (!net.length || note) return;
+      const want = missing ? missing.size : expected;
+      let l = 0, t = 0;
+      for (const x of net) { l += x.loaded; t += x.total; }
+      if (net.length >= want && net.every(x => x.done || (x.total > 0 && x.loaded >= x.total))) say(`Förbereder ${what}…`);
+      else if (net.length >= want && t > 0) {
+        shownPct = Math.max(shownPct, Math.floor(100 * l / t));   // går aldrig bakåt
+        say(`Laddar ner ${what}: ${shownPct} % av ${fmtMB(t)} (bara första gången – sedan är den sparad i webbläsaren).`);
+      } else say(`Laddar ner ${what}…`);
+    };
     try {
       const r = await host.guarded({
         op: 'load', repo: MODELS[this.model].repo, device: b.device, dtype: b.dtype, threads: this.threads, abort: host.abort?.buffer,
@@ -346,6 +414,7 @@ class Engine {
       return host;
     } catch (e) {
       host.kill('LOAD'); this._hosts.delete(host);
+      e.phase = host.phase;
       throw e;
     }
   }
@@ -365,9 +434,12 @@ class Engine {
           this.primary = await this._load(b);
         } catch (e) {
           if (this._stop) throw new StopSignal();
-          if (isLast) throw this._loadError(e, b);
-          // Hängde sig grafikkortet redan vid provkörningen minns vi det; andra laddfel (t.ex. nätet) glöms.
-          this._fallback(b, e.code === 'TIMEOUT' ? 'hang' : 'load', e.code === 'TIMEOUT');
+          // Avstannad nedladdning beror på nätet, inte på motorn: en annan motor hjälper inte.
+          const stalled = e.code === 'TIMEOUT' && e.phase === 'fetch';
+          if (isLast || stalled) throw this._loadError(e, b);
+          // Hängde sig grafikkortet när modellen byggdes eller provkördes minns vi det; andra laddfel glöms.
+          const hung = e.code === 'TIMEOUT';
+          this._fallback(b, hung ? 'hang' : 'load', hung);
           continue;
         }
       }
@@ -378,7 +450,8 @@ class Engine {
   }
 
   _loadError(e, b) {
-    if (e.code === 'TIMEOUT') return new EngineError('LOAD_TIMEOUT', `Modellen gick inte att starta på ${b.label} (inget svar). Kontrollera nätanslutningen och försök igen.`, e);
+    if (e.code === 'TIMEOUT' && e.phase === 'fetch') return new EngineError('LOAD_TIMEOUT', 'Nedladdningen av modellen avstannade. Kontrollera nätanslutningen och försök igen.', e);
+    if (e.code === 'TIMEOUT') return new EngineError('LOAD_TIMEOUT', `Modellen gick inte att starta på ${b.label} (inget svar). Ladda om sidan och försök igen.`, e);
     return new EngineError('LOAD_FAILED', `Modellen kunde inte laddas (${e.message}). Kontrollera nätanslutningen och försök igen.`, e);
   }
 
@@ -391,6 +464,7 @@ class Engine {
     const next = this.chain[this.bi];
     const text = {
       garbage: `${cap(b.label)} gav felaktig text – byter till ${next.label} och gör om delen.`,
+      unverified: `${cap(b.label)} gav osäker text som inte gick att kontrollera – byter till ${next.label} och gör om delen.`,
       strikes: `${cap(b.label)} gav felaktig text – byter till ${next.label}.`,
       hang: `${cap(b.label)} svarade inte – byter till ${next.label} och fortsätter.`,
       crash: `${cap(b.label)} kraschade – byter till ${next.label} och fortsätter.`,
@@ -438,10 +512,10 @@ class Engine {
         if (this._stop || e instanceof StopSignal) throw new StopSignal();
         // krasch, fel i beräkningen eller ingen reaktion
         this._drop('primary');
-        st.crashes++; restarts++; this.stats.restarts++;
+        st.crashes++; restarts++; this.stats.restarts++; this._restartDebt++;
         const hang = e.code === 'TIMEOUT';
         if (!isLast && (hang || st.crashes >= 2)) { this._fallback(b, hang ? 'hang' : 'crash', true); restarts = 0; continue; }
-        if (restarts > this.t.maxRestartsPerWindow || this.stats.restarts > this.t.maxRestartsPerRun) {
+        if (restarts > this.t.maxRestartsPerWindow || this._restartDebt > this.t.maxRestarts) {
           throw new EngineError(hang ? 'HANG' : 'CRASH', hang
             ? 'Modellen slutade svara flera gånger. Försök fortsätta, eller ladda om sidan.'
             : `Modellen kraschade flera gånger (${e.message}). Försök fortsätta, eller ladda om sidan.`, e);
@@ -455,15 +529,24 @@ class Engine {
       const v = checkWindow({ text, activeS, hitMax: r.stats.hitMax, avgLogprob: r.stats.avgLogprob });
       if (v.ok) {
         if (st.windows === 3 && !st.strikes) memory.markGood(this.model, b.id);
+        st.streak = 0;
+        // kontrollmotorn håller en hel modell i minnet: släpp den när den inte behövts på länge
+        if (this.reference && ++st.clean >= this.t.referenceIdleWindows) this._drop('reference');
         return { pieces: r.pieces, wallMs, stats: r.stats };
       }
+      st.clean = 0;
 
       if (!isLast) {
         if (v.hard) { this._fallback(b, 'garbage', true); continue; }
-        if (!st.trusted && this.t.verify) {
+        // Lösa bokstäver ("a a ar a ar") sparas aldrig okontrollerade från grafikkortet – inte ens när
+        // det i övrigt visat sig pålitligt.
+        const mustVerify = v.kind === 'gibberish';
+        if (this.t.verify && (mustVerify || !st.trusted)) {
           const out = await this._verify(win, activeS, r, v, b, st);
-          return { ...out, wallMs: performance.now() - began };
+          if (out.redo) continue;   // gick inte att kontrollera: gör om fönstret på nästa motor
+          return { pieces: out.pieces, stats: out.stats, verdict: out.verdict, wallMs: performance.now() - began - out.loadMs };
         }
+        if (mustVerify) { this._fallback(b, 'unverified', false); continue; }
       } else if (v.hard) {
         // skräp även från sista motorn: starta om en gång, ge sedan upp utan att spara något
         this._drop('primary');
@@ -481,35 +564,48 @@ class Engine {
 
   /**
    * Misstänkt text från grafikkortet: räkna om fönstret på nästa motor och jämför.
-   * Returnerar bitarna som ska sparas. Ger kontrollen upprepat rätt och grafikkortet fel väljs
-   * grafikkortet bort; är de överens beror det på ljudet och grafikkortet behålls.
+   * Returnerar bitarna som ska sparas (och loadMs = tid som gick åt till att ladda kontrollmotorn),
+   * eller { redo: true } om fönstret måste göras om på nästa motor. Ger kontrollen riktig text och
+   * grafikkortet något annat är det ett fel hos grafikkortet, som väljs bort när felen blir flera;
+   * säger båda samma sak beror det på ljudet och grafikkortet behålls.
    */
   async _verify(win, activeS, r, v, b, st) {
     const nb = this.chain[this.bi + 1];
-    this._status(`Kontrollerar en osäker del med ${nb.label}…`);
     this.stats.verified++;
-    let ref;
+    let ref, loadMs = 0;
     try {
-      if (!this.reference || this.reference.dead) this.reference = await this._load(nb, { quiet: true });
+      if (!this.reference || this.reference.dead) {
+        const t0 = performance.now();
+        this.reference = await this._load(nb, { reference: true });
+        loadMs = performance.now() - t0;
+      }
+      this._status(`Kontrollerar en osäker del med ${nb.label}…`);
       ref = await this._runOn(this.reference, nb, win);
     } catch (e) {
       if (this._stop || e instanceof StopSignal) throw new StopSignal();
       this._drop('reference');
-      // kontrollmotorn gick inte att använda: behåll det som går att rädda från första försöket
-      return { pieces: salvage(r.pieces, v), stats: r.stats, verdict: v };
+      // Kontrollmotorn gick inte att använda. Lösa bokstäver går inte att lita på utan kontroll:
+      // lämna grafikkortet för den här körningen och gör om fönstret (inget sparas). Annat som bara
+      // är osäkert behålls så långt det går att rädda.
+      if (v.kind === 'gibberish') { this._fallback(b, 'unverified', false); return { redo: true }; }
+      return { pieces: salvage(r.pieces, v), stats: r.stats, verdict: v, loadMs };
     }
     const refText = joinText(ref.pieces);
     const rv = checkWindow({ text: refText, activeS, hitMax: ref.stats.hitMax, avgLogprob: ref.stats.avgLogprob });
     const similar = textSimilarity(joinText(r.pieces), refText) >= 0.5;
     if (rv.ok && !similar) {
       // kontrollen gav riktig text som skiljer sig: aktiv motor räknade fel
-      st.strikes++;
-      if (st.strikes >= this.t.strikesToDemote && st.strikes >= 0.2 * st.windows) this._fallback(b, 'strikes', true);
-      return { pieces: ref.pieces, stats: ref.stats };
+      st.strikes++; st.streak++;
+      if (st.strikes >= this.t.strikesToDemote && (st.strikes >= 0.2 * st.windows || st.streak >= this.t.strikeStreak)) this._fallback(b, 'strikes', true);
+      return { pieces: ref.pieces, stats: ref.stats, loadMs };
     }
-    // båda säger samma sak (eller är lika osäkra): det är ljudet, inte motorn
-    if (++st.agree >= this.t.agreeToTrust) st.trusted = true;
-    return rv.ok ? { pieces: ref.pieces, stats: ref.stats } : { pieces: salvage(ref.pieces, rv), stats: ref.stats, verdict: rv };
+    if (similar) {
+      // båda säger samma sak: det är ljudet, inte motorn
+      st.streak = 0;
+      if (++st.agree >= this.t.agreeToTrust && !st.trusted) { st.trusted = true; this._drop('reference'); }
+    }
+    // (olika men båda osäkra: varken fel eller falsklarm – kontrollens text används)
+    return rv.ok ? { pieces: ref.pieces, stats: ref.stats, loadMs } : { pieces: salvage(ref.pieces, rv), stats: ref.stats, verdict: rv, loadMs };
   }
 
   // ---- huvudslingan
@@ -556,14 +652,16 @@ class Engine {
         (b) => `Transkriberar ${fmt(start, wh)}–${fmt(start + useS, wh)} av ${fmt(this.duration, wh)} med ${b.label}…`);
       this._checkStop();
       this.stats.windows++;
+      this._restartDebt = Math.max(0, this._restartDebt - 0.1);
 
       const commit = (forceFull) => planCommit({
         pieces: res.pieces, winStart: start, useS, isLast, cutInSilence: plan.cutInSilence, tailActive: plan.tailActive,
         activeAfter: (t) => activeSeconds(an, t, useS), forceFull,
       });
       let c = commit(false);
-      // nödbroms: flera fönster i rad som knappt kommer framåt -> ta hela fönstret
-      smallAdvances = c.next - start < 2 ? smallAdvances + 1 : 0;
+      // nödbroms: tre fönster i rad som knappt kommer framåt (t.ex. musik som modellen bara ger
+      // korta bitar för) -> ta hela fönstret, så att körningen aldrig kryper fram
+      smallAdvances = c.next - start < 5 ? smallAdvances + 1 : 0;
       if (smallAdvances >= 3) { c = commit(true); smallAdvances = 0; }
       let next = Math.min(start + useS, Math.max(c.next, start + MIN_ADVANCE_S));
       if (next >= this.duration - 0.3) next = this.duration;

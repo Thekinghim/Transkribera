@@ -66,6 +66,40 @@ test('svagt tal släpps aldrig', () => {
   // tal som hörs över rumsbrus
   assert.equal(planWindowAudio(analyseWindow(audio(['speech', 30, -38]).map((x, i) => x + dB(-55) * 3.4 * rnd())), false).skip, undefined);
 });
+test('svag inspelning (tal 40–50 dB under normal nivå) räknas inte som tystnad', () => {
+  // mikrofon längst bak i salen: talet ligger under -60 dBFS men modellen klarar det bra
+  for (const level of [-65, -75]) {
+    const pcm = audio(['zero', 2], ['speech', 12, level], ['zero', 0.6], ['speech', 15.4, level]).map(x => x - dB(-75) * rnd() * (x ? 1 : 0));
+    const an = analyseWindow(pcm, -100);
+    const p = planWindowAudio(an, false);
+    assert.ok(p.why === 'lead' && p.skip < 2 || p.skip == null, `${level} dBFS: ${JSON.stringify(p)}`);
+    assert.ok(an.activeS > 10, `${level} dBFS: aktivt ${an.activeS}`);
+  }
+  // … men svagt brus utan tal är fortfarande tystnad
+  assert.equal(planWindowAudio(analyseWindow(audio(['noise', 30, -68])), false).why, 'silent');
+});
+test('jämn nivå räcker inte för att hoppa över: hårt komprimerat tal körs genom modellen', () => {
+  // automatisk förstärkning: nivån är konstant, men klangen växlar mellan mörka och ljusa ljud
+  const n = 30 * SAMPLE_RATE, pcm = new Float32Array(n);
+  let lp = 0;
+  for (let i = 0; i < n; i++) {
+    const bright = Math.floor(i / (0.12 * SAMPLE_RATE)) % 2 === 0;       // växlar var 120 ms
+    const x = rnd();
+    lp += 0.05 * (x - lp);                                               // mörkt (lågpassat) brus
+    pcm[i] = bright ? x : lp;
+  }
+  for (let f = 0; f + 480 <= n; f += 480) {                              // samma nivå i varje 30 ms-ruta
+    let e = 0;
+    for (let i = f; i < f + 480; i++) e += pcm[i] * pcm[i];
+    const g = dB(-30) / Math.sqrt(e / 480);
+    for (let i = f; i < f + 480; i++) pcm[i] *= g;
+  }
+  const an = analyseWindow(pcm);
+  const act = Array.from(an.db).sort((a, b) => a - b);
+  assert.ok(act[Math.round(0.97 * (act.length - 1))] - act[Math.round(0.03 * (act.length - 1))] < 3, 'testljudet har jämn nivå');
+  assert.equal(an.steady, false);
+  assert.equal(planWindowAudio(an, false).skip, undefined);
+});
 test('brusgolv från resten av filen gör bedömningen försiktigare, aldrig djärvare', () => {
   const pcm = audio(['noise', 30, -52]);                          // rumsbrus
   assert.ok(planWindowAudio(analyseWindow(pcm), false).skip);      // ensamt: tystnad
@@ -142,6 +176,16 @@ test('planCommit: oavslutad sista bit sparas inte – nästa fönster börjar vi
 test('planCommit: en enda bit utan sluttid tas hel', () => {
   const r = planCommit({ pieces: [piece(0, null, 'en lång mening utan slut')], winStart: 60, useS: 30 });
   assert.equal(r.rule, 'open-full'); assert.deepEqual([r.segments[0].start, r.segments[0].end, r.next], [60, 90, 90]);
+});
+test('planCommit: fönster utan paus (brusig inspelning) fortsätter från sista tidsstämpeln om det låter efter den', () => {
+  const pieces = [piece(0, 9), piece(9, 28.6, 'och inte kyrkobok.')];
+  const noisy = { pieces, winStart: 30, useS: 30, cutInSilence: false, tailActive: true, activeAfter: (t) => 30 - t };
+  const r = planCommit(noisy);
+  assert.equal(r.rule, 'uncut-tail'); assert.equal(r.next, 58.6); assert.equal(r.segments.length, 2);
+  // klippt i en paus, sista fönstret eller tyst efter tidsstämpeln: hela fönstret som förut
+  assert.equal(planCommit({ ...noisy, cutInSilence: true, tailActive: false }).rule, 'full');
+  assert.equal(planCommit({ ...noisy, isLast: true }).rule, 'full');
+  assert.equal(planCommit({ ...noisy, activeAfter: () => 0 }).rule, 'full');
 });
 test('planCommit: skydd mot stillastående', () => {
   // första biten slutar vid 0,4 s, resten oavslutad: skulle annars bara flytta 0,4 s
